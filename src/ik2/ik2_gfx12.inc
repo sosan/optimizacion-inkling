@@ -431,7 +431,7 @@ void launch_experts_mma_wmma(const uint8_t* const* blob, int S, size_t off, cons
         experts_mma_wmma_kernel<false, 4><<<g, 4 * 32, 0, s>>>(blob, off, C, F, x16, x_ld, h, y, sg, su, gcap, ucap);
 }
 // (a grouped expert tile runs on the matrix cores only on gfx12 / RDNA4: anywhere else the emulated path stays)
-inline bool ik2_expert_wmma_ok() {
+bool ik2_expert_wmma_ok() {
     static const bool ok = [] {
         if (getenv("IK2_EXPERT_WMMA") && atoi(getenv("IK2_EXPERT_WMMA")) == 0) return false;
         int dev = 0;

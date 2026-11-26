@@ -7476,6 +7476,11 @@ void attn_slots_f16(const uint16_t*, const float*, int, const float*, const uint
                     float*, const float*, int, uint16_t*, cudaStream_t) { tc_out("attn_slots_f16"); }
 // upstream PR #8: RDNA4 (gfx1200/gfx1201) matrix-core expert GEMMs; emulated elsewhere
 #include "ik2_gfx12.inc"
+// The benchmark calls these templates from another TU: instantiate them here.
+template void launch_experts_mma_wmma<true>(const uint8_t* const*, int, size_t, const uint16_t*, int, int, int,
+                                            const float*, const float*, float, float, uint16_t*, float*, cudaStream_t);
+template void launch_experts_mma_wmma<false>(const uint8_t* const*, int, size_t, const uint16_t*, int, int, int,
+                                             const float*, const float*, float, float, uint16_t*, float*, cudaStream_t);
 // the AMD build's own kernels (wave32 RDNA 3 / 3.5, measured on gfx1151): docs/AMD_INKLING2_GFX1151.md
 #include "ik2_fuse.inc"      // IK2_FUSE_MASK: the resident decode's small kernels, fewer and shorter
 #include "ik2_experts2.inc"  // IK2_FUSE_MASK 0x1000..0x8000: batch-1 expert GEMVs, x in registers
