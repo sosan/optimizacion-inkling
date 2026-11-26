@@ -1,0 +1,146 @@
+name: Publish release (artifacts existentes)
+
+# Publica artifacts de builds ya completados, sin recompilar.
+# Para Inkling: ejecuta primero "build-inkling-custom-engine-linux.yml" y/o
+# "build-inkling-custom-engine-windows.yml", después usa este workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: 'Qué build publicar'
+        required: true
+        default: 'inkling-linux'
+        type: choice
+        options:
+          - inkling-linux
+          - inkling-windows
+          - inkling-all
+      inkling_linux_run_id:
+        description: 'Run ID del build Linux Inkling (vacío = último run exitoso)'
+        required: false
+        default: ''
+      inkling_windows_run_id:
+        description: 'Run ID del build Windows Inkling (vacío = último run exitoso)'
+        required: false
+        default: ''
+      run_id:
+        description: 'Run ID para los builds clásicos (vacío = último run exitoso)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish-inkling-linux:
+    name: publish (Inkling Linux)
+    if: inputs.backend == 'inkling-linux' || inputs.backend == 'inkling-all' || inputs.backend == 'all'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolver run Linux de Inkling
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.inkling_linux_run_id }}" ]; then
+            RUN_ID="${{ inputs.inkling_linux_run_id }}"
+          else
+            RUN_ID=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/build-inkling-custom-engine-linux.yml/runs?status=success&per_page=1" \
+              --jq '.workflow_runs[0].id')
+          fi
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::No se encontró ningún run exitoso de build-inkling-custom-engine-linux.yml"
+            echo "::error::Ejecuta primero el workflow Inkling para Ubuntu."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Descargar artifact Linux
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          pattern: inkling-custom-engine-*-ubuntu
+          path: artifacts/inkling-linux
+          merge-multiple: true
+          # (acciones/download-artifact#295): sin el token explícito, run-id de otra
+          # ejecución se ignora y encuentra 0 artefactos aunque existan
+          github-token: ${{ github.token }}
+
+      - name: Verificar artefactos Linux
+        env:
+          BUILD_RUN_ID: ${{ steps.resolve.outputs.run_id }}
+        run: |
+          count=$(find artifacts/inkling-linux -type f | wc -l)
+          find artifacts/inkling-linux -type f -exec ls -lh {} \;
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No se descargó ningún artefacto del build ${BUILD_RUN_ID}."
+            echo "::error::Revisa que ese run haya subido el binario (inkling-custom-engine-cuda*-ubuntu)."
+            exit 1
+          fi
+
+      - name: Crear GitHub Release Linux
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: inkling-custom-engine-linux-${{ github.run_id }}
+          name: "Inkling Custom Engine Linux (build ${{ steps.resolve.outputs.run_id }})"
+          generate_release_notes: true
+          files: artifacts/inkling-linux/**
+          fail_on_unmatched_files: true
+
+  publish-inkling-windows:
+    name: publish (Inkling Windows)
+    if: inputs.backend == 'inkling-windows' || inputs.backend == 'inkling-all' || inputs.backend == 'all'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolver run Windows de Inkling
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.inkling_windows_run_id }}" ]; then
+            RUN_ID="${{ inputs.inkling_windows_run_id }}"
+          else
+            RUN_ID=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/build-inkling-custom-engine-windows.yml/runs?status=success&per_page=1" \
+              --jq '.workflow_runs[0].id')
+          fi
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::No se encontró ningún run exitoso de build-inkling-custom-engine-windows.yml"
+            echo "::error::Ejecuta primero el workflow Inkling para Windows."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Descargar artifact Windows
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          pattern: inkling-custom-engine-*-windows
+          path: artifacts/inkling-windows
+          merge-multiple: true
+          # (acciones/download-artifact#295): necesario al usar run-id externo
+          github-token: ${{ github.token }}
+
+      - name: Verificar artefactos Windows
+        env:
+          BUILD_RUN_ID: ${{ steps.resolve.outputs.run_id }}
+        run: |
+          count=$(find artifacts/inkling-windows -type f | wc -l)
+          find artifacts/inkling-windows -type f -exec ls -lh {} \;
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No se descargó ningún artefacto del build ${BUILD_RUN_ID}."
+            echo "::error::Revisa que ese run haya subido el binario (inkling-custom-engine-cuda*-windows)."
+            exit 1
+          fi
+
+      - name: Crear GitHub Release Windows
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: inkling-custom-engine-windows-${{ github.run_id }}
+          name: "Inkling Custom Engine Windows (build ${{ steps.resolve.outputs.run_id }})"
+          generate_release_notes: true
+          files: artifacts/inkling-windows/**
+          fail_on_unmatched_files: true

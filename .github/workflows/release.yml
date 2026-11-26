@@ -1,0 +1,277 @@
+name: Release (tag v*)
+
+# Push a tag like v1.0.0 -> build Linux + Windows -> create a GitHub Release
+# with both binaries attached. No npm/pnpm/semantic-release: this is a CUDA/MSVC
+# project, so the version is the git tag and VERSION in the repo root.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CUDA_ARCH: all
+  CUDA_LIST: '80;86;89;90a;100;120'   # CUDA 12.8; 103/121 need a newer toolkit
+
+jobs:
+  build-linux:
+    name: Build Linux (CUDA all)
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.0-devel-ubuntu24.04
+    steps:
+      - name: Build flavor
+        id: flavor
+        shell: bash
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          SAFE=$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          if [ "$BRANCH" = "main" ] || [[ "$BRANCH" == v* ]]; then
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "nightly=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "suffix=-nightly-${SAFE}" >> "$GITHUB_OUTPUT"
+            echo "nightly=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y build-essential cmake ninja-build git ca-certificates python3 python3-pip python3-venv
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch pinned llama.cpp source
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          path: llama.cpp
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify sources
+        run: |
+          test -f engine-inkling-custom/CMakeLists.txt
+          test -f src/ik2/ik2_main.cu
+          test -f src/ik2/ik2_draft.cu
+          test -f src/ik2/ik2_cpu.cpp
+          test -f src/ik2/ik2_kernels.cu
+          test -f include/strata/artifact/gguf_reader.hpp
+          test -f llama.cpp/ggml/CMakeLists.txt
+
+      - name: Record build information
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          {
+            echo "engine=inkling-custom-engine"
+            echo "model=Inkling-2-Mini/Inkling-2-Small"
+            echo "version=$(cat VERSION)"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "llama_cpp=3cf03257f219afbe7334045ff7c6a06ac68c627d"
+            echo "cuda_arch=${{ env.CUDA_ARCH }}"
+            echo "cuda=12.8"
+            echo "os=ubuntu-24.04"
+          } > build-info.txt
+
+      - name: Configure
+        run: |
+          cmake -S engine-inkling-custom -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_LIST }}"
+
+      - name: Build
+        run: cmake --build build --target inkling-custom-engine -j "$(nproc)"
+
+      - name: Verify executable
+        run: test -x build/inkling-custom-engine && ls -lh build/inkling-custom-engine
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkling-custom-engine-linux${{ steps.flavor.outputs.suffix }}
+          path: |
+            build/inkling-custom-engine
+            build-info.txt
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (CUDA all)
+    runs-on: windows-2022
+    steps:
+      - name: Build flavor
+        id: flavor
+        shell: bash
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          SAFE=$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          if [ "$BRANCH" = "main" ] || [[ "$BRANCH" == v* ]]; then
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "nightly=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "suffix=-nightly-${SAFE}" >> "$GITHUB_OUTPUT"
+            echo "nightly=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch pinned llama.cpp source
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          path: llama.cpp
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.8.0"
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --yes --no-progress
+
+      - name: Verify sources
+        shell: pwsh
+        run: |
+          @(
+            "engine-inkling-custom/CMakeLists.txt",
+            "src/ik2/ik2_main.cu",
+            "src/ik2/ik2_draft.cu",
+            "src/ik2/ik2_cpu.cpp",
+            "src/ik2/ik2_kernels.cu",
+            "include/strata/artifact/gguf_reader.hpp",
+            "llama.cpp/ggml/CMakeLists.txt"
+          ) | ForEach-Object { if (-not (Test-Path $_)) { throw "Missing required source: $_" } }
+
+      - name: Record build information
+        shell: pwsh
+        run: |
+          $lines = @(
+            "engine=inkling-custom-engine"
+            "model=Inkling-2-Mini/Inkling-2-Small"
+            "version=$(Get-Content VERSION -Raw)"
+            "revision=$(git rev-parse HEAD)"
+            "llama_cpp=3cf03257f219afbe7334045ff7c6a06ac68c627d"
+            "cuda_arch=${{ env.CUDA_ARCH }}"
+            "cuda=12.8"
+            "os=windows-2022"
+          )
+          Set-Content -Path build-info.txt -Value $lines -Encoding ascii
+
+      - name: Configure
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S engine-inkling-custom -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_LIST }}" ^
+            -DSTRATA_GGML_DIR="%GITHUB_WORKSPACE%\llama.cpp"
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build build --target inkling-custom-engine -j %NUMBER_OF_PROCESSORS%
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build/inkling-custom-engine.exe)) { throw "Executable not found" }
+          Get-Item build/inkling-custom-engine.exe | Format-List Name,Length,FullName
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkling-custom-engine-windows${{ steps.flavor.outputs.suffix }}
+          path: |
+            build/inkling-custom-engine.exe
+            build-info.txt
+          if-no-files-found: error
+
+  # Reusable workflow: Linux + Windows x gfx1201/gfx1151 (ROCm 6.4 / TheRock 7.14.0).
+  build-hip:
+    uses: ./.github/workflows/build-ik2-hip.yml
+
+  release:
+    name: Create GitHub Release
+    needs: [build-linux, build-windows, build-hip]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build flavor
+        id: flavor
+        shell: bash
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          SAFE=$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          if [ "$BRANCH" = "main" ] || [[ "$BRANCH" == v* ]]; then
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "nightly=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "suffix=-nightly-${SAFE}" >> "$GITHUB_OUTPUT"
+            echo "nightly=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout (for release notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: inkling-custom-engine-linux${{ steps.flavor.outputs.suffix }}
+          path: dist/linux
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: inkling-custom-engine-windows${{ steps.flavor.outputs.suffix }}
+          path: dist/windows
+
+      - name: Rename binaries with version
+        id: release_tag
+        run: |
+          BASE="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          [ -n "$BASE" ] || { echo "No tag (dispatch without input?)" >&2; exit 1; }
+          TAG="${BASE}${{ steps.flavor.outputs.suffix }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Releasing as ${TAG}"
+          mv dist/linux/build/inkling-custom-engine "dist/linux/inkling-custom-engine-${TAG}-linux"
+          mv dist/windows/build/inkling-custom-engine.exe "dist/windows/inkling-custom-engine-${TAG}-windows.exe"
+          find dist -type f -exec ls -lh {} \;
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Inkling 2 Mini engine ${{ steps.release_tag.outputs.tag }}
+          prerelease: ${{ steps.flavor.outputs.nightly == 'true' }}
+          generate_release_notes: true
+          files: |
+            dist/linux/inkling-custom-engine-*-linux
+            dist/windows/inkling-custom-engine-*-windows.exe
+            dist/linux/build-info.txt
+            dist/windows/build-info.txt
+          fail_on_unmatched_files: true

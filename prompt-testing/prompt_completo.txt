@@ -1,0 +1,33 @@
+Actúa como ingeniero de software senior. Debes diseñar e implementar la
+integración entre tres sistemas:
+
+CONTEXTO
+- Un monolito legacy (Java 8 + Oracle) que gestiona pedidos y NO se puede
+  modificar de forma significativa.
+- Un proveedor de pagos externo con API REST y webhooks. Los webhooks pueden
+  llegar duplicados, fuera de orden o con retraso de hasta 24 h.
+- Un ERP que solo expone una API SOAP lenta (p95 = 8 s) y con límite de
+  10 peticiones por segundo.
+
+REQUISITOS
+1. Cada pago confirmado debe reflejarse exactamente una vez en el ERP.
+2. Si el ERP está caído, no se puede perder ningún evento ni bloquear el
+   checkout.
+3. Debe soportar 2.000 pedidos/minuto en picos.
+4. Los reembolsos parciales pueden llegar antes que el pago original.
+5. Se requiere trazabilidad completa para auditoría (PCI y RGPD).
+6. El equipo es de 4 personas y el plazo es de 3 meses.
+
+ENTREGABLES
+a) Lista de supuestos y preguntas que harías antes de empezar. Si algún
+   requisito es ambiguo o contradictorio, señálalo.
+b) Arquitectura propuesta con alternativas descartadas y por qué.
+c) Modelo de datos y estados del pedido/pago.
+d) Código de los componentes más críticos (idempotencia, reintentos y
+   reordenación de eventos), en el lenguaje que consideres adecuado.
+e) Estrategia de tests, incluyendo cómo probarías los fallos de red y las
+   condiciones de carrera.
+f) Los 5 principales riesgos y cómo los mitigarías.
+g) Plan de despliegue y rollback sin downtime.
+
+Sé explícito sobre lo que NO sabes y sobre los compromisos que asumes.

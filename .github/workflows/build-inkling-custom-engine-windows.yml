@@ -1,0 +1,171 @@
+name: Build Inkling 2 Custom Engine (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: "Arquitectura CUDA (80=Ampere, 86=RTX 30, 89=RTX 40, 90a=Hopper, 100=B200/GB200, 103=B300/GB300, 120=RTX 50, 121=DGX Spark GB10)"
+        required: true
+        default: "86"
+        type: choice
+        options:
+          - "all"
+          - "80"
+          - "86"
+          - "89"
+          - "90a"
+          - "100"
+          - "103"
+          - "120"
+          - "121"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inkling-custom-engine-windows-${{ github.ref }}-${{ inputs.cuda_arch }}
+  cancel-in-progress: true
+
+jobs:
+  build-inkling-windows:
+    name: inkling-custom-engine Windows CUDA ${{ inputs.cuda_arch }} (${{ github.ref_name }})
+    runs-on: windows-2022
+
+    steps:
+      - name: Build flavor
+        id: flavor
+        shell: bash
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          SAFE=$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          if [ "$BRANCH" = "main" ] || [[ "$BRANCH" == v* ]]; then
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "label=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "suffix=-nightly-${SAFE}" >> "$GITHUB_OUTPUT"
+            echo "label=nightly (${BRANCH})" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout self-contained source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch pinned llama.cpp source
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          path: llama.cpp
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.8.0"
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --yes --no-progress
+
+      - name: Verify self-contained engine sources
+        shell: pwsh
+        run: |
+          @(
+            "engine-inkling-custom/CMakeLists.txt",
+            "src/ik2/ik2_main.cu",
+            "src/ik2/ik2_draft.cu",
+            "src/ik2/ik2_cpu.cpp",
+            "src/ik2/ik2_kernels.cu",
+            "include/strata/artifact/gguf_reader.hpp",
+            "llama.cpp/ggml/CMakeLists.txt"
+          ) | ForEach-Object { if (-not (Test-Path $_)) { throw "Missing required source: $_" } }
+
+      - name: Record build information
+        id: info
+        shell: pwsh
+        run: |
+          $lines = @(
+            "engine=inkling-custom-engine",
+            "model=Inkling-2-Mini/Inkling-2-Small",
+            "source=self-contained checkout",
+            "revision=$(git rev-parse HEAD)",
+            "llama_cpp=https://github.com/ggml-org/llama.cpp",
+            "llama_cpp_revision=3cf03257f219afbe7334045ff7c6a06ac68c627d",
+            "cuda_arch=${{ inputs.cuda_arch }}",
+            "channel=${{ steps.flavor.outputs.label }}",
+            "cuda=12.8",
+            "os=windows-2022"
+          )
+          Set-Content -Path build-info.txt -Value $lines -Encoding ascii
+          "revision=$(git rev-parse HEAD)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Set CUDA architecture list
+        id: arches
+        shell: pwsh
+        run: |
+          $cudaArch = '${{ inputs.cuda_arch }}'
+          $cudaList = if ($cudaArch -eq 'all') { '80;86;89;90a;100;120' } else { $cudaArch }   # CUDA 12.8; 103/121 need a newer toolkit
+          "list=$cudaList" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Configure inkling-custom-engine only
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S engine-inkling-custom -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DSTRATA_ENABLE_CUDA=ON ^
+            -DSTRATA_BUILD_TESTS=OFF ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ steps.arches.outputs.list }}" ^
+            -DSTRATA_GGML_DIR="%GITHUB_WORKSPACE%\llama.cpp"
+
+      - name: Build inkling-custom-engine
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build build --target inkling-custom-engine -j %NUMBER_OF_PROCESSORS%
+
+      - name: Build expert A/B benchmark
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build build --target ik2_expert_bench -j %NUMBER_OF_PROCESSORS%
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          $exe = "build/inkling-custom-engine.exe"
+          if (-not (Test-Path $exe)) { throw "Executable not found: $exe" }
+          $bench = "build/ik2_expert_bench.exe"
+          if (-not (Test-Path $bench)) { throw "Executable not found: $bench" }
+          Get-Item $exe, $bench | Format-List Name,Length,FullName
+
+      - name: Upload expert benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ik2-expert-bench-cuda${{ inputs.cuda_arch }}-windows${{ steps.flavor.outputs.suffix }}
+          path: build/ik2_expert_bench.exe
+          if-no-files-found: error
+
+      - name: Upload inkling-custom-engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkling-custom-engine-cuda${{ inputs.cuda_arch }}-windows${{ steps.flavor.outputs.suffix }}
+          path: |
+            build/inkling-custom-engine.exe
+            build-info.txt
+          if-no-files-found: error
+
+      - name: Build summary
+        shell: pwsh
+        run: |
+          $revision = git rev-parse HEAD
+          @(
+            "## Inkling Custom Engine build"
+            ""
+            "- Engine: ``inkling-custom-engine``"
+            "- CUDA architecture: ``${{ inputs.cuda_arch }}``"
+            "- Source revision: ``$revision``"
+            "- Output: ``inkling-custom-engine.exe``"
+          ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY

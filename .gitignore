@@ -1,0 +1,10 @@
+__pycache__/
+local/
+# artefactos locales: binarios compilados y pesos del modelo (se descargan, no se versionan)
+/build/
+/build-vision/
+/models/
+/.venv/
+/bench-results/
+/IDS.txt
+/prompt.txt

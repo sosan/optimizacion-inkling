@@ -1,0 +1,169 @@
+name: Build Inkling 2 Custom Engine (Ubuntu)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: "Arquitectura CUDA (80=Ampere, 86=RTX 30, 89=RTX 40, 90a=Hopper, 100=B200/GB200, 103=B300/GB300, 120=RTX 50, 121=DGX Spark GB10)"
+        required: true
+        default: "86"
+        type: choice
+        options:
+          - "all"
+          - "80"
+          - "86"
+          - "89"
+          - "90a"
+          - "100"
+          - "103"
+          - "120"
+          - "121"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inkling-custom-engine-${{ github.ref }}-${{ inputs.cuda_arch }}
+  cancel-in-progress: true
+
+jobs:
+  build-inkling:
+    name: inkling-custom-engine Ubuntu CUDA ${{ inputs.cuda_arch }} (${{ github.ref_name }})
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+    steps:
+      - name: Build flavor
+        id: flavor
+        shell: bash
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          SAFE=$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          if [ "$BRANCH" = "main" ] || [[ "$BRANCH" == v* ]]; then
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "label=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "suffix=-nightly-${SAFE}" >> "$GITHUB_OUTPUT"
+            echo "label=nightly (${BRANCH})" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y build-essential cmake ninja-build git ca-certificates python3 python3-pip python3-venv
+
+      - name: Checkout self-contained source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch pinned llama.cpp source
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          path: llama.cpp
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Fetch pinned llama.cpp vision source
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: b12590
+          path: third_party/llama.cpp-b12590
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify self-contained engine sources
+        run: |
+          test -f engine-inkling-custom/CMakeLists.txt
+          test -f src/ik2/ik2_main.cu
+          test -f src/ik2/ik2_draft.cu
+          test -f src/ik2/ik2_cpu.cpp
+          test -f src/ik2/ik2_kernels.cu
+          test -f include/strata/artifact/gguf_reader.hpp
+          test -f llama.cpp/ggml/CMakeLists.txt
+
+      - name: Record build information
+        id: info
+        run: |
+          # dentro del contenedor (root) el repo del runner no es de confianza:
+          # sin esto git rev-parse falla con "dubious ownership" y la revisión sale vacía
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          {
+            echo "engine=inkling-custom-engine"
+            echo "model=Inkling-2-Mini/Inkling-2-Small"
+            echo "source=self-contained checkout"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "llama_cpp=https://github.com/ggml-org/llama.cpp"
+            echo "llama_cpp_revision=3cf03257f219afbe7334045ff7c6a06ac68c627d"
+            echo "cuda_arch=${{ inputs.cuda_arch }}"
+            echo "channel=${{ steps.flavor.outputs.label }}"
+            echo "cuda=12.8"
+            echo "os=ubuntu-24.04"
+          } > build-info.txt
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set CUDA architecture list
+        id: arches
+        run: |
+          if [ "${{ inputs.cuda_arch }}" = "all" ]; then
+            echo "list=80;86;89;90a;100;120" >> "$GITHUB_OUTPUT"   # supported by CUDA 12.8 in the container; 103/121 need a newer toolkit
+          else
+            echo "list=${{ inputs.cuda_arch }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure inkling-custom-engine only
+        run: |
+          cmake -S engine-inkling-custom -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSTRATA_ENABLE_CUDA=ON \
+            -DSTRATA_BUILD_TESTS=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ steps.arches.outputs.list }}"
+
+      - name: Build inkling-custom-engine
+        run: cmake --build build --target inkling-custom-engine -j "$(nproc)"
+
+      - name: Build expert A/B benchmark
+        run: cmake --build build --target ik2_expert_bench -j "$(nproc)"
+
+      - name: Verify executable
+        run: |
+          test -x build/inkling-custom-engine
+          test -x build/ik2_expert_bench
+          ls -l build/inkling-custom-engine build/ik2_expert_bench
+          if command -v readelf >/dev/null 2>&1; then
+            readelf -h build/inkling-custom-engine | head -n 12
+          fi
+
+      - name: Upload expert benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ik2-expert-bench-cuda${{ inputs.cuda_arch }}-ubuntu${{ steps.flavor.outputs.suffix }}
+          path: build/ik2_expert_bench
+          if-no-files-found: error
+
+      - name: Upload inkling-custom-engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkling-custom-engine-cuda${{ inputs.cuda_arch }}-ubuntu${{ steps.flavor.outputs.suffix }}
+          path: |
+            build/inkling-custom-engine
+            build-info.txt
+          if-no-files-found: error
+
+      - name: Build summary
+        env:
+          REVISION: ${{ steps.info.outputs.revision }}
+        run: |
+          {
+            echo "## Inkling Custom Engine build"
+            echo ""
+            echo "- Engine: \`inkling-custom-engine\`"
+            echo "- CUDA architecture: \`${{ inputs.cuda_arch }}\`"
+            echo "- Source revision: \`${REVISION}\`"
+            echo "- Output: \`inkling-custom-engine\`"
+          } >> "$GITHUB_STEP_SUMMARY"

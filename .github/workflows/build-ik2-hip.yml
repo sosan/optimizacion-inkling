@@ -1,0 +1,138 @@
+name: Build Inkling 2 Custom Engine (AMD HIP)
+
+# Verifies the RDNA4 (gfx12) WMMA paths and the emulated path on Strix Halo
+# (gfx1151), on Linux and Windows. Linux installs ROCm via apt; Windows uses
+# AMD's TheRock SDK tarball through a reusable composite action.
+on:
+  push:
+    branches: ['pr/**', 'exp/**']
+    paths:
+      - 'CMakeLists.txt'
+      - 'src/ik2/**'
+      - 'tests/ik2_expert_bench.cu'
+      - 'include/strata/hip_compat/**'
+      - '.github/workflows/build-ik2-hip.yml'
+  workflow_dispatch:
+  # Called from release.yml so a version tag gates the release on the HIP matrix too.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ik2-hip-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux HIP ${{ matrix.gfx }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        gfx: ['gfx1201', 'gfx1151']
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install ROCm and build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates wget gnupg2
+          wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+          {
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/6.4/ubuntu noble main"
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.4/ noble main"
+          } | sudo tee /etc/apt/sources.list.d/rocm.list
+          # Ubuntu's older rocminfo/rocm-cmake conflict with the 6.4 stack: prefer AMD's repo.
+          printf 'Package: *\nPin: origin "repo.radeon.com"\nPin-Priority: 1001\n' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update
+          sudo apt-get remove -y rocminfo rocm-cmake || true
+          sudo apt-get install -y cmake ninja-build build-essential rocm-hip-sdk hipblas
+          /opt/rocm/bin/rocminfo | head -20 || true
+
+      - name: Verify sources
+        run: |
+          test -f CMakeLists.txt
+          test -f src/ik2/ik2_main.cu
+          test -f src/ik2/ik2_kernels.cu
+          test -f tests/ik2_expert_bench.cu
+          test -f include/strata/hip_compat/cuda_fp8.h
+
+      - name: Configure (HIP)
+        shell: bash
+        run: |
+          export PATH=/opt/rocm/bin:$PATH
+          cmake -S . -B build-hip -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSTRATA_ENABLE_HIP=ON \
+            -DSTRATA_HIP_IK2_SPIKE=ON \
+            -DAMDGPU_TARGETS="${{ matrix.gfx }}"
+
+      - name: Build engine and RDNA4 benchmark
+        shell: bash
+        run: |
+          export PATH=/opt/rocm/bin:$PATH
+          cmake --build build-hip --target inkling-custom-engine ik2_expert_bench -j "$(nproc)"
+
+      - name: Verify executables
+        run: ls -lh build-hip/inkling-custom-engine build-hip/ik2_expert_bench
+
+  windows:
+    name: Windows HIP ${{ matrix.gfx }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        gfx: ['gfx1201', 'gfx1151']
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install AMD TheRock HIP SDK
+        uses: Jaded-Encoding-Thaumaturgy/vs-wheels/.github/actions/setup-hip-windows@master
+        with:
+          hip-version: '7.14.0'
+
+      - name: Install CMake and Ninja
+        shell: pwsh
+        run: choco install cmake ninja --yes --no-progress
+
+      - name: Verify sources
+        shell: pwsh
+        run: |
+          @("CMakeLists.txt", "src/ik2/ik2_main.cu", "src/ik2/ik2_kernels.cu",
+            "tests/ik2_expert_bench.cu", "include/strata/hip_compat/cuda_fp8.h") |
+            ForEach-Object { if (-not (Test-Path $_)) { throw "Missing: $_" } }
+
+      - name: Configure (HIP)
+        shell: pwsh
+        run: |
+          cmake -S . -B build-hip -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DSTRATA_ENABLE_HIP=ON `
+            -DSTRATA_HIP_IK2_SPIKE=ON `
+            "-DAMDGPU_TARGETS=${{ matrix.gfx }}" `
+            "-DCMAKE_CXX_FLAGS=--rocm-path=$env:ROCM_PATH --rocm-device-lib-path=$env:HIP_DEVICE_LIB_PATH"
+
+      - name: Build engine and RDNA4 benchmark
+        shell: pwsh
+        run: cmake --build build-hip --target inkling-custom-engine ik2_expert_bench --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Verify executables
+        shell: pwsh
+        run: |
+          Get-Item build-hip/inkling-custom-engine.exe, build-hip/ik2_expert_bench.exe | Format-Table Name,Length

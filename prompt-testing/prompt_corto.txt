@@ -1,0 +1,9 @@
+Eres ingeniero de software senior. Un proveedor de pagos te envía webhooks
+que pueden llegar duplicados, desordenados y con hasta 24 h de retraso. Debes
+reflejar cada pago confirmado exactamente una vez en un ERP SOAP que tarda
+8 s por petición y admite 10 peticiones por segundo, con picos de 2.000
+pedidos por minuto. El ERP puede caerse y no se puede perder ningún evento.
+
+Entrega: (1) supuestos y contradicciones que detectes, (2) arquitectura en
+menos de 15 líneas, (3) código de la parte de idempotencia y reordenación,
+(4) cómo lo probarías.
