@@ -4,6 +4,22 @@
 // kernels. Included only by the HIP branch of ik2_kernels.cu. CUDA is untouched.
 #if defined(STRATA_USE_HIP)
 
+// The CUDA branch defines these two beside its PTX tensor-core helpers. HIP needs them too:
+// ue4m3's byte -> FP16 bits (both halves), and two E2M1 codes times one UE4M3 scale -> FP16x2.
+__device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {
+    const int e = (int) ((x >> 3) & 15u), m = (int) (x & 7u);
+    const float v = (x == 0x7Fu) ? 0.0f : (e ? ldexpf(1.0f + (float) m / 8.0f, e - 7) : (float) m * 0x1.0p-10f);
+    const uint16_t h = __half_as_ushort(__float2half_rn(v));
+    return (uint32_t) h | ((uint32_t) h << 16);
+}
+__device__ __forceinline__ uint32_t ik2_fp4pair(uint32_t v, uint32_t scale) {
+    static const float kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    const float s = __half2float(__ushort_as_half((uint16_t) (scale & 0xFFFFu)));
+    const uint16_t lo = __half_as_ushort(__float2half_rn(kv[v & 15u] * s));
+    const uint16_t hi = __half_as_ushort(__float2half_rn(kv[(v >> 4) & 15u] * s));
+    return (uint32_t) lo | ((uint32_t) hi << 16);
+}
+
 // mma.sync m16n8k16's fragment layout is kept exactly, so every kernel that builds fragments is unchanged: a
 // lane's group g = lane >> 2 and tig t = lane & 3 hold rows g and g + 8, columns 2 t and 2 t + 1 of the 16 x 8
 // result; A's a[0..3] are A[g][2t, 2t+1], A[g+8][2t, 2t+1], A[g][2t+8, 2t+9], A[g+8][2t+8, 2t+9]; B's b0, b1
