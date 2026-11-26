@@ -4275,8 +4275,22 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
         k::dsc_slots(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.tok,
                      g_blk.inv, g_blk.sg, g_blk.su, g_blk.wt, g_s);
         if (k::experts_nv_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {   // (set 16's tiles)
-            k::experts_rows_nv(g_blk.blob, g_blk.tok, S, Ly.eb[0], Ly.eb[0] + Ly.eb[1], W.xq, C, c.F, g_blk.sg,
-                               g_blk.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
+            if (T == 1 && C % 64 == 0 && c.F % 64 == 0 && k::ik2_expert_wmma_ok()) {
+                // Upstream PR #8: gfx12's matrix core for NVFP4 experts. The kernels take FP16
+                // operands (the gate input as hi/lo limbs, the down input as h16), so stage the
+                // token once and keep the existing h16 / y32 buffers as outputs.
+                static bool told = false;
+                if (!told) std::printf("IK2_EXPERT_WMMA: gfx12 matrix-core NVFP4 expert GEMMs\n"), told = true;
+                uint16_t* limbs = (uint16_t*) W.gu32;
+                k::to_f16_limbs(W.xq, (size_t) C, limbs, g_s);
+                k::launch_experts_mma_wmma<true>(g_blk.blob, S, Ly.eb[0], limbs, C, C, c.F, g_blk.sg, g_blk.su,
+                                                 c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
+                k::launch_experts_mma_wmma<false>(g_blk.blob, S, Ly.eb[0] + Ly.eb[1], W.h16, c.F, C, c.F, g_blk.sg,
+                                                  g_blk.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
+            } else {
+                k::experts_rows_nv(g_blk.blob, g_blk.tok, S, Ly.eb[0], Ly.eb[0] + Ly.eb[1], W.xq, C, c.F, g_blk.sg,
+                                   g_blk.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
+            }
         } else if (Ly.ty[0] == Ly.ty[1] && k::experts_q8_fits(Ly.ty[0], C, c.F) && k::experts_q8_fits(Ly.ty[2], C, c.F)) {
             k::experts_gate_up_swiglu_q8(g_blk.blob, g_blk.tok, S, Ly.eb[0], W.xq, C, c.F, g_blk.sg, g_blk.su,
                                          c.gate_cap, c.up_cap, W.h16, g_s);   // (set 15's)
