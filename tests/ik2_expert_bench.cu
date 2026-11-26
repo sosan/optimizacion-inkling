@@ -95,8 +95,19 @@ std::vector<uint8_t> rand_blocks(const Quant& q, size_t n_values) {
 int main(int argc, char** argv) {
     const char* mode = argc > 1 ? argv[1] : "gate";
     const bool fused_gate = std::strcmp(mode, "gatefused") == 0, fused_down = std::strcmp(mode, "downfused") == 0;
+    const bool wmma_gate = std::strcmp(mode, "gatewmma") == 0, wmma_down = std::strcmp(mode, "downwmma") == 0;
+#if defined(STRATA_USE_HIP)
+    const bool wmma = wmma_gate || wmma_down;
+    if (wmma && !ik2::k::ik2_expert_wmma_ok()) {
+        std::printf("this GPU is not gfx12 (or IK2_EXPERT_WMMA=0): the matrix-core path is unavailable\n");
+        return 2;
+    }
+#else
+    const bool wmma = false;
+    if (wmma_gate || wmma_down) { std::printf("gatewmma/downwmma need a HIP build\n"); return 2; }
+#endif
     const bool fused = fused_gate || fused_down;
-    const bool gate = std::strcmp(mode, "gate") == 0 || std::strcmp(mode, "gate1") == 0 || fused_gate;
+    const bool gate = std::strcmp(mode, "gate") == 0 || std::strcmp(mode, "gate1") == 0 || fused_gate || wmma_gate;
     const bool single = std::strcmp(mode, "gate1") == 0 || std::strcmp(mode, "down1") == 0;   // (the one-token path)
     const int iters = argc > 2 ? std::atoi(argv[2]) : 20;
     const char* out_path = argc > 3 ? argv[3] : nullptr;
@@ -190,6 +201,15 @@ int main(int argc, char** argv) {
                 ik2::k::experts_gate_up_swiglu_mma(dblob, S, eb0, dinput2, C, F, dsg, dsu, 20.0f, 20.0f, dh, s);
             else
                 ik2::k::experts_down_mma(dblob, S, eb0 + eb1, dh, C, F, dy, s);
+#if defined(STRATA_USE_HIP)
+        } else if (wmma) {
+            if (gate)
+                ik2::k::launch_experts_mma_wmma<true>(dblob, G, eb0, dinput2, C, C, F, dsg, dsu, 20.0f, 20.0f, dh, dy,
+                                                      s);
+            else
+                ik2::k::launch_experts_mma_wmma<false>(dblob, G, eb0 + eb1, dh, F, C, F, dsg, dsu, 20.0f, 20.0f, dh,
+                                                       dy, s);
+#endif
         } else if (fused) {
             // llama.cpp's IQ / native dot kernels through the FP16 activation adapter:
             // one call per expert group, 8 token columns at a time, same weights and shapes.

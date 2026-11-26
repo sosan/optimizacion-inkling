@@ -207,6 +207,18 @@ void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const 
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
                   float* y, cudaStream_t s);
 #if defined(STRATA_USE_HIP)
+/// Upstream PR #8: RDNA4 gfx1200/gfx1201 matrix-core expert GEMMs (ik2_gfx12.inc). Off unless the
+/// device is gfx12 and IK2_EXPERT_WMMA != 0; every other arch keeps the emulated path.
+bool ik2_expert_wmma_ok();
+template <bool Gate>
+void launch_experts_mma_wmma(const uint8_t* const* blob, int S, size_t off, const uint16_t* x16, int x_ld, int C,
+                             int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h, float* y,
+                             cudaStream_t s);
+template <bool Gate>
+void launch_grouped_expert_wmma(const uint8_t* const* blob, const int* tok, int G, size_t off, int C, int F,
+                                const uint16_t* h, uint16_t* hidden, float* y, const float* sg, const float* su,
+                                float gcap, float ucap, const int* n, const int* row, const uint16_t* input16,
+                                cudaStream_t s);
 /// IK2_FUSE_MASK 0x1000 / 0x2000 (ik2_experts2.inc): experts_gate_up_swiglu / experts_down for NVFP4 experts at
 /// C 2304, F 1152 (experts_nv_fits), x in registers - the same values to the bit (tests/ik2_experts_test.cu)
 bool experts_nv_fits(int ty_gate, int ty_up, int ty_down, int C, int F);
