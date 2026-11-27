@@ -2953,15 +2953,24 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
                 k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
                 k::experts_pf_nvfp4(td, nt, pf_bm, 1, sorted_input, F, C, sorted_out, g_s);
             } else {
-                for (int e : X.hit_exps) {
-                    const size_t offset = W.start[e];
-                    gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
-                }
+                // upstream issue #36: on gfx906 the grouped prefill GEMM replaces the per-expert decode + GEMM
+                const bool pf906 = k::g906pf_mm(Ly.ty[0], (int) X.hit_exps.size(), X.hit_exps.data(),
+                                                X.slot_ptrs.data(), W.start.data(), W.cnt.data(), 0, Ly.eb[0], F,
+                                                sorted_input, C, 2 * F, X.gu32, g_s);
+                if (!pf906)
+                    for (int e : X.hit_exps) {
+                        const size_t offset = W.start[e];
+                        gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
+                    }
                 k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
-                for (int e : X.hit_exps) {
-                    const size_t offset = W.start[e];
-                    down_product(e, sorted_input + offset * F, sorted_out + offset * C);
-                }
+                const bool pd906 = k::g906pf_mm(Ly.ty[2], (int) X.hit_exps.size(), X.hit_exps.data(),
+                                                X.slot_ptrs.data(), W.start.data(), W.cnt.data(), Ly.eb[0] + Ly.eb[1],
+                                                0, C, sorted_input, F, C, sorted_out, g_s);
+                if (!pd906)
+                    for (int e : X.hit_exps) {
+                        const size_t offset = W.start[e];
+                        down_product(e, sorted_input + offset * F, sorted_out + offset * C);
+                    }
             }
             combine_prefill_groups<<<T, 256, 0, g_s>>>(sorted_out, X.inv, X.wtr, C, c.K, X.tmp);
             X.pf_layers[l % Work::kPfRing] = -1;
@@ -4276,9 +4285,9 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
                      g_blk.inv, g_blk.sg, g_blk.su, g_blk.wt, g_s);
         if (k::experts_nv_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {   // (set 16's tiles)
             // upstream issue #36: on gfx906 the native v_dot2 expert kernels replace the CUDA-layout path
-            if (!(Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4 &&
-                  k::ik2_g906_experts(g_blk.blob, g_blk.tok, S, Ly.eb[0], Ly.eb[0] + Ly.eb[1], W.xq, C, c.F,
-                                      g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s))) {
+            if (!k::ik2_g906_experts(g_blk.blob, g_blk.tok, S, Ly.ty[0], Ly.ty[1], Ly.ty[2], Ly.eb[0],
+                                     Ly.eb[0] + Ly.eb[1], W.xq, W.h16, C, c.F, g_blk.sg, g_blk.su, c.gate_cap,
+                                     c.up_cap, W.h16, W.y32, g_s)) {
                 k::experts_rows_nv(g_blk.blob, g_blk.tok, S, Ly.eb[0], Ly.eb[0] + Ly.eb[1], W.xq, C, c.F, g_blk.sg,
                                    g_blk.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
             }

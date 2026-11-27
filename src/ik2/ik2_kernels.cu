@@ -7474,8 +7474,8 @@ void attn_slots_fp8(const uint16_t*, const float*, int, const float*, const uint
 void attn_slots_f16(const uint16_t*, const float*, int, const float*, const uint16_t*, const uint16_t*, int, int, int,
                     const int*, const int*, const int*, int, int, int, float, const float*, int, int, int, float*,
                     float*, const float*, int, uint16_t*, cudaStream_t) { tc_out("attn_slots_f16"); }
-// upstream issue #36: gfx906 (MI50) native NVFP4 expert kernels; other targets keep the stock path
-#include "ik2_g906.inc"
+// upstream issue #36: complete gfx906 (MI50) kernel set; other targets keep the stock path
+#include "ik2_g906_full.inc"
 // the AMD build's own kernels (wave32 RDNA 3 / 3.5, measured on gfx1151): docs/AMD_INKLING2_GFX1151.md
 #include "ik2_fuse.inc"      // IK2_FUSE_MASK: the resident decode's small kernels, fewer and shorter
 #include "ik2_experts2.inc"  // IK2_FUSE_MASK 0x1000..0x8000: batch-1 expert GEMVs, x in registers

@@ -207,11 +207,20 @@ void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const 
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
                   float* y, cudaStream_t s);
 #if defined(STRATA_USE_HIP)
-/// Upstream issue #36: gfx906 native NVFP4 expert kernels (MI50 / MI60 / Radeon VII). IK2_G906=0 off.
+/// Upstream issue #36: complete gfx906 kernel set (MI50 / MI60 / Radeon VII). IK2_G906=0 off.
 bool ik2_g906_ok();
-bool ik2_g906_experts(const uint8_t* const* blob, const int* tok, int S, size_t eb0, size_t off_down, const float* x,
-                      int C, int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h, float* y,
-                      cudaStream_t s);
+bool ik2_g906_experts(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, int ty_down,
+                      size_t eb0, size_t off_down, const float* x, const uint16_t* h, int C, int F, const float* sg,
+                      const float* su, float gcap, float ucap, uint16_t* hout, float* y, cudaStream_t s);
+bool g906pf_on();
+bool g906pf_mm(int ty, int n_exp, const int* exps, const uint8_t* const* blob, const int* start, const int* cnt,
+               size_t off_down, size_t eb0, int K, const uint16_t* x, int N, int M, float* y, cudaStream_t s);
+bool g906_group_gate_up(const uint8_t* const* blob, const int* gn, const int* gtok, const int* grow, int NG, int ty_gate,
+                        int ty_up, size_t eb0, const float* x, int C, int F, const float* sg, const float* su,
+                        float gcap, float ucap, uint16_t* h, cudaStream_t s);
+bool g906_group_down(const uint8_t* const* blob, const int* gn, const int* grow, int NG, int ty_down, size_t off_down,
+                     const uint16_t* h, int C, int F, float* y, cudaStream_t s);
+bool g906_gemm16(bool bf, const uint16_t* W, int N, int K, const uint16_t* X, int T, float* Y, int ldy, cudaStream_t s);
 /// IK2_FUSE_MASK 0x1000 / 0x2000 (ik2_experts2.inc): experts_gate_up_swiglu / experts_down for NVFP4 experts at
 /// C 2304, F 1152 (experts_nv_fits), x in registers - the same values to the bit (tests/ik2_experts_test.cu)
 bool experts_nv_fits(int ty_gate, int ty_up, int ty_down, int C, int F);
