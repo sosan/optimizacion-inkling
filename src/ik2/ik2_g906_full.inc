@@ -7,7 +7,7 @@
 // host gate (shared with ik2_g906.inc)
 bool ik2_g906_ok();
 
-#if defined(__gfx906__)
+#if defined(IK2_G906_TARGET)
 
 static bool g906lg_launch(const LoopGateArgs& a, bool compact, int n, int T, int C, int R, float eps, float* sc,
                           cudaStream_t s) {
@@ -1174,6 +1174,6 @@ bool ik2_g906_ok() { return false; }
 bool ik2_g906_experts(const uint8_t* const*, const int*, int, int, int, int, size_t, size_t, const float*,
                       const uint16_t*, int, int, const float*, const float*, float, float, uint16_t*, float*,
                       cudaStream_t) { return false; }
-#endif  // __gfx906__
+#endif  // IK2_G906_TARGET
 
 #endif   // STRATA_USE_HIP

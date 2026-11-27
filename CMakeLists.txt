@@ -27,6 +27,10 @@ if(STRATA_ENABLE_HIP)
   find_package(hipblas REQUIRED)
   # Upstream PR #26 guards the gfx1151/turbo6 paths with STRATA_USE_HIP (set by the full Maya CMake).
   add_compile_definitions(STRATA_USE_HIP=1)
+  # Issue #36's gfx906 kernels use wave64 / v_dot2 instructions that exist only on that target.
+  if(AMDGPU_TARGETS MATCHES "gfx906")
+    add_compile_definitions(IK2_G906_TARGET=1)
+  endif()
   set(IK2_GPU_BLAS roc::hipblas)
   set(IK2_GPU_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hip_compat")
   # No CUDA/HIP CMake language is enabled, so .cu must be declared as CXX explicitly; hipcc

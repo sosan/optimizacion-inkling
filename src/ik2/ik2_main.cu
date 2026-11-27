@@ -2954,18 +2954,26 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
                 k::experts_pf_nvfp4(td, nt, pf_bm, 1, sorted_input, F, C, sorted_out, g_s);
             } else {
                 // upstream issue #36: on gfx906 the grouped prefill GEMM replaces the per-expert decode + GEMM
+#if defined(STRATA_USE_HIP)
                 const bool pf906 = k::g906pf_mm(Ly.ty[0], (int) X.hit_exps.size(), X.hit_exps.data(),
                                                 X.slot_ptrs.data(), W.start.data(), W.cnt.data(), 0, Ly.eb[0], F,
                                                 sorted_input, C, 2 * F, X.gu32, g_s);
+#else
+                const bool pf906 = false;
+#endif
                 if (!pf906)
                     for (int e : X.hit_exps) {
                         const size_t offset = W.start[e];
                         gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
                     }
                 k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
+#if defined(STRATA_USE_HIP)
                 const bool pd906 = k::g906pf_mm(Ly.ty[2], (int) X.hit_exps.size(), X.hit_exps.data(),
                                                 X.slot_ptrs.data(), W.start.data(), W.cnt.data(), Ly.eb[0] + Ly.eb[1],
                                                 0, C, sorted_input, F, C, sorted_out, g_s);
+#else
+                const bool pd906 = false;
+#endif
                 if (!pd906)
                     for (int e : X.hit_exps) {
                         const size_t offset = W.start[e];
