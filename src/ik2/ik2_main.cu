@@ -2740,6 +2740,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
 void prefetch_layer(Model& M, int l, Work& W, ExpertCache& EC, int T, const Work* Wpop = nullptr, int own = -1, int ahead = 1) {
     const int pr = ((l % Work::kPfRing) + Work::kPfRing) % Work::kPfRing;
     W.pf_layers[pr] = -1;
+    // issue #35: this ring slot's events are reused by the layer kPfRing layers later. If g_s is still
+    // waiting on one of them, cudaEventRecord resetting it can leave that wait pending forever (a hang
+    // under ptrace, a drifted fault without it). Drain the old waits before re-recording any event.
+    for (size_t i = 0; i < W.pf_evs[pr].size(); ++i) CU(cudaStreamWaitEvent(g_s, W.pf_evs[pr][i], 0));
     if (getenv("IK2_PREFETCH") && !std::atoi(getenv("IK2_PREFETCH"))) return;
     if (!g_overlap || g_prof || l >= M.c.n_layer || (!dual() && M.L[l].dev != g_cur)) return;
     const Work& U = Wpop ? *Wpop : W;   // (whose picks so far: under EP, GPU 0's)
@@ -5724,6 +5728,9 @@ int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigS
 void big_end(Work& W, ExpertCache& EC, BigScratch& bs) {
     if (bs.pool < 0) return;
     CU(cudaStreamSynchronize(g_cs));
+    // issue #35: the lazy-CPU stream may still be copying experts whose source was the lent scratch.
+    // Give the pool back only after it too is done, or the next lender frees the memory underneath it.
+    if (g_ls) CU(cudaStreamSynchronize(g_ls));
     CU(cudaStreamSynchronize(g_s));
     W.h = bs.h, W.r = bs.r, W.tmp = bs.tmp, W.blocks = bs.blocks, W.gu32 = bs.gu32, W.qkv = bs.qkv, W.y32 = bs.y32;
     W.sg = bs.sg, W.su = bs.su, W.wt = bs.wt, W.wtr = bs.wtr, W.rlog = bs.rlog, W.xq16_sup = bs.xq16_sup;
