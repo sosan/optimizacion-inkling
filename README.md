@@ -23,6 +23,8 @@ Medido en este repo con `bench_perf.sh` (RTX 3090 24 GB, `UD-Q4_K_XL`, KV FP8, `
 
 El drafter añade ~1,2 GiB y solo compensa en código/ediciones; la config conservadora es `ik2-mini-text-nodraft.json`.
 
+**GPUs AMD gfx906 (MI50 / MI60 / Radeon VII)**: el camino HIP tradicional decodifica los bloques NVFP4 en registros y alimenta tensor cores de gfx11, pero en gfx906 no hay esa unidad. Los kernels nativos del upstream [issue #36](https://github.com/alesha-pro/maya-inkling-mini/issues/36) usan `v_dot2_f32_f16` sobre los códigos convertidos a pares FP16, y se incluyen aquí tras `#if defined(STRATA_USE_HIP)` (CUDA no cambia). En una MI50 de 32 GB con `UD-Q4_K_XL` y KV FP8, el propio reporte mide **41,7 → 79,2 tok/s (1,90×)** en decode de una conversación, ~28 → ~200 tok/s totales con `--parallel 8`, y prefill de 4K a ~486 → ~800 tok/s. El muteo `IK2_G906=0` restaura el camino tradicional; el dispatch solo se activa en device `gfx906` y con expertos NVFP4, así que las demás GPUs siguen igual.
+
 ## 0. Clonar el repo
 
 ```bash

@@ -4275,8 +4275,13 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
         k::dsc_slots(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.tok,
                      g_blk.inv, g_blk.sg, g_blk.su, g_blk.wt, g_s);
         if (k::experts_nv_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {   // (set 16's tiles)
-            k::experts_rows_nv(g_blk.blob, g_blk.tok, S, Ly.eb[0], Ly.eb[0] + Ly.eb[1], W.xq, C, c.F, g_blk.sg,
-                               g_blk.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
+            // upstream issue #36: on gfx906 the native v_dot2 expert kernels replace the CUDA-layout path
+            if (!(Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4 &&
+                  k::ik2_g906_experts(g_blk.blob, g_blk.tok, S, Ly.eb[0], Ly.eb[0] + Ly.eb[1], W.xq, C, c.F,
+                                      g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s))) {
+                k::experts_rows_nv(g_blk.blob, g_blk.tok, S, Ly.eb[0], Ly.eb[0] + Ly.eb[1], W.xq, C, c.F, g_blk.sg,
+                                   g_blk.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
+            }
         } else if (Ly.ty[0] == Ly.ty[1] && k::experts_q8_fits(Ly.ty[0], C, c.F) && k::experts_q8_fits(Ly.ty[2], C, c.F)) {
             k::experts_gate_up_swiglu_q8(g_blk.blob, g_blk.tok, S, Ly.eb[0], W.xq, C, c.F, g_blk.sg, g_blk.su,
                                          c.gate_cap, c.up_cap, W.h16, g_s);   // (set 15's)
