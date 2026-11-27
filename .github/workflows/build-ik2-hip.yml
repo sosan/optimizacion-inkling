@@ -84,6 +84,15 @@ jobs:
       - name: Verify executables
         run: ls -lh build-hip/inkling-custom-engine build-hip/ik2_expert_bench
 
+      - name: Upload HIP binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ik2-hip-${{ matrix.gfx }}-ubuntu
+          path: |
+            build-hip/inkling-custom-engine
+            build-hip/ik2_expert_bench
+          if-no-files-found: error
+
   windows:
     name: Windows HIP ${{ matrix.gfx }}
     runs-on: windows-2022
@@ -136,3 +145,12 @@ jobs:
         shell: pwsh
         run: |
           Get-Item build-hip/inkling-custom-engine.exe, build-hip/ik2_expert_bench.exe | Format-Table Name,Length
+
+      - name: Upload HIP binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ik2-hip-${{ matrix.gfx }}-windows
+          path: |
+            build-hip/inkling-custom-engine.exe
+            build-hip/ik2_expert_bench.exe
+          if-no-files-found: error
