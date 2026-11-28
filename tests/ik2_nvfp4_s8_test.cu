@@ -21,6 +21,11 @@ static uint32_t byte_perm_ref(uint32_t x, uint32_t y, uint32_t s) {
     return out;
 }
 
+static uint32_t word_ref(const uint8_t* p, int i) {
+    return uint32_t(p[4 * i]) | (uint32_t(p[4 * i + 1]) << 8) |
+           (uint32_t(p[4 * i + 2]) << 16) | (uint32_t(p[4 * i + 3]) << 24);
+}
+
 static uint32_t frag_ref(uint32_t q4, int t) {
     const uint32_t nibs = (t & 2) ? ((q4 >> 4) & 0x0F0F0F0Fu) : (q4 & 0x0F0F0F0Fu);
     const uint32_t sel = (nibs & 0x0Fu) | ((nibs >> 4) & 0xF0u) |
@@ -47,7 +52,7 @@ int main() {
         for (int i = 0; i < 32; ++i) b.qs[i] = uint8_t(rng());
     std::vector<uint32_t> want(n);
     for (int k = 0; k < n / 4; ++k)
-        for (int t = 0; t < 4; ++t) want[k * 4 + t] = frag_ref(load_b4(h[k].qs, 0), t);
+        for (int t = 0; t < 4; ++t) want[k * 4 + t] = frag_ref(word_ref(h[k].qs, 0), t);
 
     Block *db = nullptr;
     uint32_t *dw = nullptr;
