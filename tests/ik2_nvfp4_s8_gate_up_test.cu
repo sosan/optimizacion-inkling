@@ -18,8 +18,6 @@
 #include <random>
 #include <vector>
 
-namespace k = ik2::k;
-
 #define CU(x)                                                                                  \
     do {                                                                                       \
         cudaError_t e_ = (x);                                                                  \
