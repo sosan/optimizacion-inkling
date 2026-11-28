@@ -15,6 +15,12 @@ del modelo, los snippets `OPENAI_*` / Claude Code y el comando de parada.
 > a terceros, compartirlo o revender el acceso) podría **infringir las reglas de
 > uso de Google** y las condiciones del servicio de Colab. Úsalo bajo tu propia
 > responsabilidad y no lo ofrezcas como servicio público.
+>
+> Tampoco elimina las limitaciones de Colab: la **disponibilidad de las tarjetas
+> gráficas** (las G4 pueden agotarse y el launcher reintenta con backoff) y los
+> **límites de duración de las sesiones** siguen existiendo. La sesión puede
+> caducar o ser recuperada por la plataforma; reconecta con `tunnel` si la VM sigue
+> vivo y para siempre la sesión con `stop` cuando termines.
 
 ## Requisitos
 
