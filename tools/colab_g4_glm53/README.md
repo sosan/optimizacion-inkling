@@ -5,7 +5,8 @@ VM **Google Colab G4** (RTX PRO 6000 Blackwell 96 GB), compila Project Maya para
 `sm_120`, descarga y empaqueta un EXL3 "abliterated" de GLM-5.3-Flash (321B-A18B)
 junto al drafter DFlash2, arranca el servidor compatible OpenAI/Anthropic 
 en `:8090` de la VM y abre un port-forward SSH **autoreparable** hacia 
-`http://127.0.0.1:18100`.
+`http://127.0.0.1:18100`. Opcionalmente mantiene la VM despierta con un watchdog
+remoto y puede exponer el endpoint mediante un túnel Cloudflare público (opt-in).
 
 Cuando `/v1/models` responde `200 OK`, imprime los endpoints locales, el nombre
 del modelo, los snippets `OPENAI_*` / Claude Code y el comando de parada.
@@ -41,22 +42,47 @@ python3 colab_g4.py start                       # 2.51 bpw, 131K, puerto 18100
 python3 colab_g4.py start 3.05                  # equilibrado
 python3 colab_g4.py start 4.05 --ctx 262144    # calidad Q4, contexto largo
 python3 colab_g4.py start 2.51 --bg             # túnel en segundo plano
+python3 colab_g4.py start --keepalive           # + watchdog remoto (VM despierta)
+python3 colab_g4.py keepalive glm53 18100 --bg  # reenganchar el watchdog
 python3 colab_g4.py tunnel glm53 18100 --bg     # reconectar tras dormir el portátil
-python3 colab_g4.py stop                        # cerrar túnel y cortar facturación
+python3 colab_g4.py stop                        # cerrar túnel/watchdog y cortar facturación
 ```
 
 ```bat
 :: Windows
 py colab_g4.py start
 py colab_g4.py start 3.05 --ctx 262144
+py colab_g4.py start --keepalive
+py colab_g4.py keepalive glm53 18100 --bg
 py colab_g4.py tunnel glm53 18100 --bg
 py colab_g4.py stop
 ```
 
 Opciones comunes: `--ctx 131072|262144`, `--port N`, `--session NAME`,
-`--no-wait` (no esperar a que haya G4 libre). `REMOTE_PORT` cambia el puerto
+`--no-wait` (no esperar a que haya G4 libre), `--keepalive` (watchdog remoto),
+`--tunnel ssh|cf` (por defecto `ssh`). `REMOTE_PORT` cambia el puerto
 remoto (por defecto `8090`); `COLAB_MAX_ATTEMPTS`, `COLAB_RETRY_BASE` y
 `COLAB_WAIT_CAP` controlan los reintentos de asignación G4.
+
+## Watchdog remoto y `--keepalive`
+
+Colab puede recoger la VM cuando el kernel de Jupyter lleva ~20 min inactivo,
+aunque el túnel SSH siga reconectando. `--keepalive` lanza un daemon local que
+ejecuta el watchdog de `remote_provision.py` en slices de 15 min mediante
+`colab exec`: emite un heartbeat cada 60 s (mantiene ocupado el kernel), comprueba
+`/v1/models` y reinicia el servidor Maya si muere. Si elegiste Cloudflare,
+también reabre el túnel y guarda la URL nueva en el meta. `stop` detiene el
+watchdog, el túnel y la sesión. El modo se guarda en el archivo de metadatos
+(`TUNNEL_MODE`, `WATCHDOG`, `CLOUDFLARE_URL`) y se reutiliza al reconectar.
+
+## Túnel Cloudflare (opt-in)
+
+`start --tunnel cf` abre un **Quick Tunnel público** (`https://*.trycloudflare.com/v1`)
+en la VM. No es el modo por defecto. **Aviso importante**: el servidor Maya
+acepta cualquier cadena `Bearer`, así que la URL pública **no está realmente
+autenticada**. Úsala solo para pruebas personales, no la compartas ni la ofrezcas
+como servicio; puede infringir las condiciones de Google Colab (ver aviso arriba).
+El modo `ssh` sigue siendo local y recomendado.
 
 ## Endpoints tras el `200 OK`
 

@@ -82,6 +82,19 @@ def paths(session: str, port: int) -> dict[str, Path]:
     return {"pid": d / f"{stem}.pid", "log": d / f"{stem}.log", "meta": d / f"{stem}.env"}
 
 
+CF_URL_REGEX = re.compile(r"https://(?!api\.)[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+
+def paths_keepalive(session: str) -> dict[str, Path]:
+    d = Path(tempfile.gettempdir())
+    stem = f"colab-keepalive-{session}"
+    return {"pid": d / f"{stem}.pid", "log": d / f"{stem}.log"}
+
+
+def remote_script_path() -> Path:
+    return Path(__file__).resolve().parent / "remote_provision.py"
+
+
 def run(cmd: list[str], *, capture: bool = False, env: dict | None = None,
         input_text: str | None = None, check: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, text=True, capture_output=capture, env=env,
@@ -190,18 +203,40 @@ def load_remote_script() -> str:
 
 
 
-def provision(session: str, port: int, tier: str, ctx: int, bg: bool, wait: bool) -> None:
+def stream_remote_script(ssh: list[str], script: str) -> tuple[int, str | None]:
+    """Run the Python provisioner on the VM via SSH stdin, streaming its output
+    so provisioning progress (and a Cloudflare URL) reaches the local CLI."""
+    proc = subprocess.Popen(ssh, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    assert proc.stdin is not None and proc.stdout is not None
+    proc.stdin.write(script)
+    proc.stdin.close()
+    url: str | None = None
+    for line in proc.stdout:
+        text = line.rstrip("\n")
+        if text:
+            print(text, flush=True)
+        if text.startswith("TUNNEL_BASE_URL="):
+            url = text.split("=", 1)[1].strip()
+    return proc.wait(), url
+
+
+def provision(session: str, port: int, tier: str, ctx: int, bg: bool, wait: bool,
+              tunnel_mode: str = "ssh") -> str | None:
     key = ensure_key()
     t = TIERS[tier]
     args = [t["repo"], t["dir"], str(ctx), t["p"], tier, "1" if COLOR else "0"]
-    ssh = ssh_args(session, key, command=["bash", "-s", "--"] + args)
+    if tunnel_mode == "cf":
+        args.append("--cloudflare")
+    # The provisioner is Python: feed it to `python3 -`, not to bash.
+    ssh = ssh_args(session, key, command=["python3", "-"] + args)
     attempts, attempt = 4, 1
     while True:
-        r = subprocess.run(ssh, input=load_remote_script(), text=True)
-        if r.returncode == 0:
-            return
-        if r.returncode in (42, 130):
-            raise SystemExit(r.returncode)
+        rc, url = stream_remote_script(ssh, load_remote_script())
+        if rc == 0:
+            return url
+        if rc in (42, 130):
+            raise SystemExit(rc)
         if attempt >= attempts:
             hint = f"python {Path(__file__).resolve()} stop {session} {port}"
             raise SystemExit(paint(f"\n  ✗ No se pudo aprovisionar tras {attempts} intentos. Para parar la facturación: {hint}", "yellow"))
@@ -213,21 +248,25 @@ def provision(session: str, port: int, tier: str, ctx: int, bg: bool, wait: bool
                 continue
             raise SystemExit(paint(f"\n  ✗ La sesión {session} ya no está activa.", "yellow"))
         delay = attempt * 5
-        print(f"\n  {paint('▸', 'yellow')} SSH/WebSocket interrumpido (rc={r.returncode}). Reconectando ({attempt}/{attempts}) en {delay}s...")
+        print(f"\n  {paint('▸', 'yellow')} SSH/WebSocket interrumpido (rc={rc}). Reconectando ({attempt}/{attempts}) en {delay}s...")
         time.sleep(delay)
         attempt += 1
 
 
-def write_meta(session: str, port: int, tier: str, ctx: int) -> None:
+def write_meta(session: str, port: int, tier: str, ctx: int, *, tunnel_mode: str = "ssh",
+               watchdog: bool = False, cf_url: str = "") -> None:
     p = paths(session, port)["meta"]
-    p.write_text(f'MODEL_TIER="{tier}"\nMODEL_CTX="{ctx}"\nMODEL_NAME="glm-5.3-flash-uncensored-{tier}bpw"\n',
-                 encoding="utf-8")
+    p.write_text(
+        f'MODEL_TIER="{tier}"\nMODEL_CTX="{ctx}"\nMODEL_NAME="glm-5.3-flash-uncensored-{tier}bpw"\n'
+        f'TUNNEL_MODE="{tunnel_mode}"\nWATCHDOG="{1 if watchdog else 0}"\nCLOUDFLARE_URL="{cf_url}"\n',
+        encoding="utf-8")
 
 
 def load_meta(session: str, port: int) -> dict[str, str]:
     meta = paths(session, port)["meta"]
-    out: dict[str, str] = {}
-    overrides = {k: os.environ.get(k) for k in ("MODEL_TIER", "MODEL_CTX", "MODEL_NAME")}
+    out: dict[str, str] = {"TUNNEL_MODE": "ssh", "WATCHDOG": "0", "CLOUDFLARE_URL": ""}
+    overrides = {k: os.environ.get(k) for k in
+                 ("MODEL_TIER", "MODEL_CTX", "MODEL_NAME", "TUNNEL_MODE", "WATCHDOG", "CLOUDFLARE_URL")}
     if meta.exists():
         for line in meta.read_text(encoding="utf-8").splitlines():
             if "=" in line:
@@ -298,28 +337,32 @@ def stop_command(session: str, port: int) -> str:
     return base if (session, port) == ("glm53", 18100) else f"{base} {session} {port}"
 
 
-def ready_summary(session: str, port: int, mode: str) -> None:
+def ready_summary(session: str, port: int, mode: str, base_url: str | None = None) -> None:
     meta = load_meta(session, port)
     name = model_name(meta, port)
+    public = bool(base_url)
+    api_base = base_url if base_url else f"http://127.0.0.1:{port}/v1"
     print()
     print(paint("╭" + "─" * 72 + "╮", "green"))
     print(paint("│", "green"), paint("● GLM-5.3-Flash Uncensored — LISTO (200 OK)", "green bold"))
     print(paint("╰" + "─" * 72 + "╯", "green"))
+    root = base_url[:-3] if public else f"http://127.0.0.1:{port}"
     for k, v in (("Session", f"{session} (~10.05 CU/hr)"), ("GPU", "RTX PRO 6000 Blackwell (96 GB)"),
                  ("Tier / Contexto", f"{meta.get('MODEL_TIER', 'auto')} bpw / {ctx_label(meta.get('MODEL_CTX',''))}"),
-                 ("Túnel", mode), ("Host local", "127.0.0.1"), ("Puerto local", str(port)),
-                 ("Modelo", name), ("OpenAI Base URL", f"http://127.0.0.1:{port}/v1"),
-                 ("Anthropic Base URL", f"http://127.0.0.1:{port}"), ("Web UI", f"http://127.0.0.1:{port}/"),
+                 ("Túnel", mode), ("Modelo", name), ("OpenAI Base URL", api_base),
+                 ("Anthropic Base URL", root), ("Web UI", root + "/"),
                  ("API Key", "sk-local (cualquier cadena no vacía)")):
         print(f"  {paint(f'{k:<19}', 'dim')} {v}")
+    if public:
+        print(" ", paint("  AVISO: endpoint público; el servidor Maya no valida el token. No lo compartas ni lo expongas como servicio.", "yellow"))
     print()
     print(" ", paint("OpenAI env", "bold"))
-    for line in (f'OPENAI_BASE_URL="http://127.0.0.1:{port}/v1"',
+    for line in (f'OPENAI_BASE_URL="{api_base}"',
                  'OPENAI_API_KEY="sk-local"', f'OPENAI_MODEL="{name}"'):
         print("   ", paint(("set " + line) if IS_WIN else ("export " + line), "cyan"))
     print()
     print(" ", paint("Claude Code", "bold"))
-    for line in (f'ANTHROPIC_BASE_URL="http://127.0.0.1:{port}"',
+    for line in (f'ANTHROPIC_BASE_URL="{root}"',
                  'ANTHROPIC_AUTH_TOKEN="sk-local"', f'ANTHROPIC_MODEL="{name}"'):
         print("   ", paint(("set " + line) if IS_WIN else (line + " \\"), "cyan"))
     print("   ", paint("claude" if IS_WIN else "    claude", "cyan"))
@@ -342,10 +385,17 @@ def terminate_pid(pid: int) -> None:
 
 
 def tunnel(session: str, port: int, bg: bool = False, child: bool = False) -> None:
+    meta = load_meta(session, port)
+    if meta.get("TUNNEL_MODE") == "cf":
+        url = meta.get("CLOUDFLARE_URL", "")
+        if url:
+            ready_summary(session, port, "cloudflare (público, opt-in)", base_url=url)
+        else:
+            print(paint("[tunnel]", "yellow"), "Modo cloudflare sin URL guardada; reconecta con `start --tunnel cf`.")
+        return
     key = ensure_key()
     p = paths(session, port)
     remote_port = int(os.environ.get("REMOTE_PORT", "8090"))
-    meta = load_meta(session, port)
 
     if bg and not child:
         if p["pid"].exists():
@@ -413,7 +463,86 @@ def tunnel(session: str, port: int, bg: bool = False, child: bool = False) -> No
         print("\n" + paint("[tunnel] Detenido.", "yellow"))
 
 
-def start(tier: str, ctx: int, port: int, session: str, bg: bool, wait: bool) -> None:
+def keepalive(session: str, port: int, bg: bool = False, child: bool = False) -> None:
+    """Run the remote watchdog in 15-minute `colab exec` slices so the Jupyter
+    cell stays busy and Colab does not reap an otherwise idle VM."""
+    p = paths_keepalive(session)
+    if bg and not child:
+        if p["pid"].exists():
+            try:
+                old = int(p["pid"].read_text().strip())
+            except ValueError:
+                old = 0
+            alive = False
+            if old:
+                if IS_WIN:
+                    alive = cmd_ok(["tasklist", "/FI", f"PID eq {old}"])
+                else:
+                    try:
+                        os.kill(old, 0)
+                        alive = True
+                    except OSError:
+                        alive = False
+            if alive:
+                print(paint("[keepalive]", "cyan"), f"Ya hay un daemon en PID {old} (log: {p['log']})")
+                return
+        log = p["log"].open("a", encoding="utf-8")
+        kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": subprocess.STDOUT}
+        if IS_WIN:
+            kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "keepalive",
+                                 session, str(port), "--child"], **kwargs)
+        p["pid"].write_text(str(proc.pid), encoding="utf-8")
+        print(paint("[keepalive]", "green"), f"Daemon iniciado (PID {proc.pid}, log: {p['log']})")
+        return
+
+    p["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+    absent = 0
+    print(paint("[keepalive]", "cyan"), f"Watchdog remoto activo para '{session}' (Ctrl+C para parar).")
+    try:
+        while True:
+            if not session_active(session):
+                absent += 1
+                if absent >= 2:
+                    print(paint("[keepalive]", "yellow"), "Sesión no activa; saliendo.")
+                    break
+                time.sleep(5)
+                continue
+            absent = 0
+            meta = load_meta(session, port)
+            cf = meta.get("TUNNEL_MODE", "ssh") == "cf"
+            cmd = [colab(), "exec", "-s", session, "--timeout", "1200",
+                   "--env", "WATCHDOG_ONLY=1",
+                   "--env", "COLAB_GLM_WATCHDOG_SECONDS=900",
+                   "--env", f"COLAB_G4_ENABLE_CF={'1' if cf else '0'}",
+                   "--env", f"REMOTE_PORT={os.environ.get('REMOTE_PORT', '8090')}",
+                   "-f", str(remote_script_path())]
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                text = line.rstrip("\n")
+                if text:
+                    print(text, flush=True)
+                if cf and text.startswith("TUNNEL_BASE_URL="):
+                    url = text.split("=", 1)[1].strip()
+                    write_meta(session, port, meta.get("MODEL_TIER", "2.51"),
+                               int(meta.get("MODEL_CTX", "131072")), tunnel_mode="cf",
+                               watchdog=True, cf_url=url)
+                    meta["CLOUDFLARE_URL"] = url
+                    print(paint(f"[keepalive] Cloudflare renovado: {url}", "green"), flush=True)
+            proc.wait()
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("\n" + paint("[keepalive] Detenido (la VM sigue activa; usa 'stop' para cerrarla).", "yellow"))
+    finally:
+        p["pid"].unlink(missing_ok=True)
+
+
+def start(tier: str, ctx: int, port: int, session: str, bg: bool, wait: bool,
+          tunnel_mode: str = "ssh", watchdog: bool = False) -> None:
     if tier not in TIERS:
         raise SystemExit(f"Tier desconocido: {tier}")
     if not colab_path().exists():
@@ -429,12 +558,29 @@ def start(tier: str, ctx: int, port: int, session: str, bg: bool, wait: bool) ->
     if not session_active(session):
         create_session(session, wait)
     show_colab_status(session)
-    provision(session, port, tier, ctx, bg, wait)
-    write_meta(session, port, tier, ctx)
-    tunnel(session, port, bg=bg)
+    cf_url = provision(session, port, tier, ctx, bg, wait, tunnel_mode=tunnel_mode)
+    write_meta(session, port, tier, ctx, tunnel_mode=tunnel_mode, watchdog=watchdog, cf_url=cf_url or "")
+    if tunnel_mode == "cf":
+        if not cf_url:
+            raise SystemExit(paint("[start] Cloudflare no devolvió URL; revisa /content/cf_tunnel.log en la VM.", "red"))
+        ready_summary(session, port, "cloudflare (público, opt-in)", base_url=cf_url)
+    else:
+        tunnel(session, port, bg=bg)
+    if watchdog:
+        keepalive(session, port, bg=True)
 
 
 def stop(session: str, port: int) -> None:
+    kp = paths_keepalive(session)
+    if kp["pid"].exists():
+        try:
+            kpid = int(kp["pid"].read_text().strip())
+        except ValueError:
+            kpid = 0
+        if kpid:
+            print(paint("[stop]", "cyan"), f"Deteniendo watchdog PID {kpid}...")
+            terminate_pid(kpid)
+        kp["pid"].unlink(missing_ok=True)
     p = paths(session, port)
     if p["pid"].exists():
         try:
@@ -476,6 +622,10 @@ def main() -> None:
     s.add_argument("--session", "-s", default="glm53")
     s.add_argument("--bg", action="store_true", help="túnel en segundo plano")
     s.add_argument("--no-wait", action="store_true", help="no esperar a que haya G4 libre")
+    s.add_argument("--tunnel", choices=("ssh", "cf"), default="ssh",
+                   help="ssh (local, por defecto) o cf (Cloudflare público, opt-in)")
+    s.add_argument("--keepalive", action="store_true",
+                   help="arrancar watchdog remoto en segundo plano para evitar que Colab recoja la VM")
     t = sub.add_parser("tunnel", help="reconectar el túnel (VM ya en marcha)")
     t.add_argument("session", nargs="?", default="glm53")
     t.add_argument("port", nargs="?", type=int, default=18100)
@@ -488,11 +638,21 @@ def main() -> None:
     x.add_argument("port", nargs="?", type=int, default=18100)
     x.add_argument("--session", "-s", dest="session_opt")
     x.add_argument("--port", "-p", dest="port_opt", type=int)
+    k = sub.add_parser("keepalive", help="watchdog remoto periódico (mantiene la VM despierta)")
+    k.add_argument("session", nargs="?", default="glm53")
+    k.add_argument("port", nargs="?", type=int, default=18100)
+    k.add_argument("--session", "-s", dest="session_opt")
+    k.add_argument("--port", "-p", dest="port_opt", type=int)
+    k.add_argument("--bg", action="store_true")
+    k.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.cmd == "start":
-        start(a.tier, a.ctx, a.port, a.session, a.bg, not a.no_wait)
+        start(a.tier, a.ctx, a.port, a.session, a.bg, not a.no_wait,
+              tunnel_mode=a.tunnel, watchdog=a.keepalive)
     elif a.cmd == "tunnel":
         tunnel(a.session_opt or a.session, a.port_opt or a.port, bg=a.bg or a.bg_child, child=a.bg_child)
+    elif a.cmd == "keepalive":
+        keepalive(a.session_opt or a.session, a.port_opt or a.port, bg=a.bg or a.child, child=a.child)
     else:
         stop(a.session_opt or a.session, a.port_opt or a.port)
 

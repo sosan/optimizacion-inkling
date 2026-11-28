@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,23 @@ DFASH_URL = ("https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF/resolve/
              "f3569acb7f9cee95e66d24442d75536eb00ab842/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf")
 ROOT = Path("/content")
 MAYA = ROOT / "project-maya"
+SERVER_CFG = ROOT / "maya-glm53.json"
+SERVER_LOG = ROOT / "maya-server.log"
+CF_LOG = ROOT / "cf_tunnel.log"
+CF_STATE = ROOT / "colab-g4-cf.json"
+REMOTE_PORT = int(os.environ.get("REMOTE_PORT", "8090"))
+CF_URL_REGEX = re.compile(r"https://(?!api\.)[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+
+def env_flag(name: str, default: str = "0") -> bool:
+    """Read and REMOVE a transient flag: `colab exec` cells share one kernel, so
+    leaving WATCHDOG_ONLY set would put later cells into watchdog mode."""
+    return os.environ.pop(name, default).strip().lower() in ("1", "true", "yes", "y")
+
+
+def cf_url(text: str) -> str | None:
+    m = CF_URL_REGEX.search(text or "")
+    return m.group(0) if m else None
 
 
 def say(*parts: object) -> None:
@@ -131,7 +149,7 @@ def write_config(model_dir: str, ctx: int, spec_p: str, tier: str) -> None:
                 "MAYA_GLM_PCIE_SHARE": "0.00", "MAYA_GLM_CPU_LANE": "18",
                 "MAYA_GLM_NGRAM_DRAFT": "1", "MAYA_GLM_DSA_GRAPHS": "1"},
     }
-    (ROOT / "maya-glm53.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    SERVER_CFG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     ok(f"Config lista: {kv_desc}, DFlash2, spec_min_p={spec_p}, CPU_LANE=18, DSA_GRAPHS=1")
 
 
@@ -146,7 +164,7 @@ def wait_server(log: Path, timeout: int = 540) -> None:
         if elapsed >= timeout:
             fail("El servidor Maya no estuvo listo en 540s.", log, 40)
         try:
-            with urllib.request.urlopen("http://127.0.0.1:8090/v1/models", timeout=1) as r:
+            with urllib.request.urlopen(f"http://127.0.0.1:{REMOTE_PORT}/v1/models", timeout=1) as r:
                 if r.status == 200:
                     ok("Modelo listo", elapsed)
                     return
@@ -158,6 +176,99 @@ def wait_server(log: Path, timeout: int = 540) -> None:
         time.sleep(2)
 
 
+# ---- keep-alive / auto-heal -------------------------------------------------
+
+def server_healthy() -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{REMOTE_PORT}/v1/models", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def server_alive() -> bool:
+    return subprocess.call(["pgrep", "-f", "serve/server.py"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL) == 0
+
+
+def start_server() -> None:
+    """Restart the Maya server from the config written during provisioning."""
+    if not SERVER_CFG.exists():
+        raise RuntimeError(f"No existe {SERVER_CFG}; aprovisiona la sesión primero")
+    for pattern in ("serve/server.py", "build/maya"):
+        subprocess.call(["pkill", "-f", pattern], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    SERVER_LOG.write_text("", encoding="utf-8")
+    with SERVER_LOG.open("a", encoding="utf-8") as f:
+        subprocess.Popen([sys.executable, str(MAYA / "serve" / "server.py"), "--engine", "maya",
+                          "--config", str(SERVER_CFG), "--host", "127.0.0.1", "--port", str(REMOTE_PORT)],
+                         stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    wait_server(SERVER_LOG, 540)
+
+
+def cloudflare_alive() -> bool:
+    return subprocess.call(["pgrep", "-f", "[c]loudflared"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL) == 0
+
+
+def start_cloudflare_tunnel() -> str:
+    """Open a Cloudflare Quick Tunnel to the VM's server and persist its URL."""
+    if not shutil.which("cloudflared"):
+        CF_LOG.parent.mkdir(parents=True, exist_ok=True)
+        shell(["curl", "-fsSL",
+               "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+               "-o", "/usr/local/bin/cloudflared"], CF_LOG)
+        shell(["chmod", "+x", "/usr/local/bin/cloudflared"], CF_LOG)
+    subprocess.call(["pkill", "-f", "[c]loudflared"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    CF_LOG.write_text("", encoding="utf-8")
+    with CF_LOG.open("a", encoding="utf-8") as f:
+        subprocess.Popen(["cloudflared", "--no-autoupdate", "tunnel", "--url",
+                          f"http://localhost:{REMOTE_PORT}"],
+                         stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    for _ in range(30):
+        url = cf_url(CF_LOG.read_text(encoding="utf-8", errors="replace"))
+        if url:
+            base = url + "/v1"
+            CF_STATE.write_text(json.dumps({"url": url, "base_url": base}) + "\n", encoding="utf-8")
+            say(f"TUNNEL_BASE_URL={base}")
+            return base
+        time.sleep(1)
+    raise RuntimeError("cloudflared no publicó su URL en 30s; revisa " + str(CF_LOG))
+
+
+def run_watchdog(seconds: int, cf_mode: bool = False) -> None:
+    """Keep the Jupyter cell busy with heartbeats and heal the server / tunnel."""
+    say(f"[watchdog] Activo {max(0, seconds)}s (cloudflare={'on' if cf_mode else 'off'}).")
+    t0 = time.monotonic()
+    last_beat = 0.0
+    failures = 0
+    while time.monotonic() - t0 < seconds:
+        if server_healthy():
+            failures = 0
+        else:
+            failures += 1
+            if failures >= 2 or not server_alive():
+                say("[watchdog] Servidor no saludable; reiniciando Maya...")
+                start_server()
+                failures = 0
+        if cf_mode and (not cloudflare_alive() or not CF_STATE.exists()):
+            say("[watchdog] cloudflared caído; reabriendo túnel...")
+            try:
+                start_cloudflare_tunnel()
+            except Exception as e:
+                say(f"[watchdog] No se pudo reabrir el túnel: {e}")
+        now = time.monotonic()
+        if now - last_beat >= 60:
+            say(f"[watchdog] heartbeat {int(now - t0):04d}s | servidor="
+                f"{'OK' if server_healthy() else 'DEGRADED'} | túnel="
+                f"{'cf' if cf_mode and cloudflare_alive() else ('ssh' if not cf_mode else 'down')}")
+            last_beat = now
+        time.sleep(min(20.0, max(0.0, seconds - (time.monotonic() - t0))))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("hf_repo")
@@ -166,7 +277,17 @@ def main() -> int:
     ap.add_argument("spec_min_p")
     ap.add_argument("tier")
     ap.add_argument("is_tty", type=int, nargs="?", default=0)
+    ap.add_argument("--cloudflare", action="store_true", help="abrir Cloudflare Quick Tunnel tras cargar el modelo")
     a = ap.parse_args()
+
+    # Transient per-cell flags: pop them so a later cell in the same Jupyter
+    # kernel does not accidentally run the watchdog again.
+    watchdog_only = env_flag("WATCHDOG_ONLY")
+    watchdog_seconds = int(os.environ.pop("COLAB_GLM_WATCHDOG_SECONDS", "900"))
+    cf_mode = a.cloudflare or env_flag("COLAB_G4_ENABLE_CF")
+    if watchdog_only:
+        run_watchdog(watchdog_seconds, cf_mode)
+        return 0
 
     os.environ["PATH"] = "/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
     model_dir = ROOT / "models" / a.model_dir
@@ -250,18 +371,14 @@ def main() -> int:
     write_config(a.model_dir, a.ctx, a.spec_min_p, a.tier)
 
     step(6, f"Cargando GLM-5.3-Flash ({a.tier} bpw) en VRAM")
-    for pattern in ("serve/server.py", "build/maya"):
-        subprocess.call(["pkill", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)
-    log = ROOT / "maya-server.log"
-    log.write_text("", encoding="utf-8")
-    with log.open("a", encoding="utf-8") as f:
-        subprocess.Popen([sys.executable, str(MAYA / "serve" / "server.py"), "--engine", "maya",
-                          "--config", str(ROOT / "maya-glm53.json"), "--host", "127.0.0.1", "--port", "8090"],
-                         stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
-                         start_new_session=True)
     say("  Esperando a que cargue el modelo (frío ~3-5 min, caliente ~25s)...")
-    wait_server(log)
+    try:
+        start_server()
+    except Exception as e:
+        fail(str(e), SERVER_LOG)
+    if cf_mode:
+        say("[cloudflare] Abriendo túnel público opt-in...")
+        start_cloudflare_tunnel()
     return 0
 
 
