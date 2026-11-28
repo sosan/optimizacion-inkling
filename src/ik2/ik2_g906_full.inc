@@ -1,14 +1,27 @@
 // src/ik2/ik2_g906_full.inc - complete gfx906 kernel set from upstream issue #36
-// (G0ldd1/mi50-playground, gfx906-kernels.patch against 27daec5). Every kernel is
-// gfx906-only; on other targets the host entry points below are stubs that decline,
-// so the engine takes the stock path. CUDA is untouched.
+// (G0ldd1/mi50-playground, gfx906-kernels.patch against 27daec5). Only built
+// when CMake sets IK2_G906_TARGET (gfx906 kernel instructions); other targets
+// get declining stubs and the engine keeps the stock path. CUDA is untouched.
 #if defined(STRATA_USE_HIP)
-
-// host gate (shared with ik2_g906.inc)
 bool ik2_g906_ok();
-
 #if defined(IK2_G906_TARGET)
 
+__device__ float4 g906lg_part4[3 * kLgcChunks * 8 * 33];
+__device__ unsigned g906lg_cnt[3];
+// a transpose step over lanes xor O: 2 O values -> O (the half the lane's bit O picks)
+template <int O>
+__device__ __forceinline__ void g906_tr32(float* v, int lane) {
+    const bool up = (lane & O) != 0;
+#pragma unroll
+    for (int k = 0; k < O; ++k) {
+        const float snd = up ? v[k] : v[k + O], keep = up ? v[k + O] : v[k];
+        v[k] = keep + __shfl_xor(snd, O, 64);
+    }
+}
+            a.y[j][(size_t) t * C + c] = (1.0f - tanhf(f)) * xv[u] + tanhf(gn) * mv[u];
+        }
+    }
+}
 static bool g906lg_launch(const LoopGateArgs& a, bool compact, int n, int T, int C, int R, float eps, float* sc,
                           cudaStream_t s) {
     static const bool on = !getenv("IK2_G906_LG") || atoi(getenv("IK2_G906_LG"));
@@ -40,31 +53,128 @@ static bool g906lg_launch(const LoopGateArgs& a, bool compact, int n, int T, int
     check("g906lg (apply)");
     return true;
 }
+// A block: 64 queries of one head, 4 waves; keys in tiles of 64.  Q, K [key][dim] and V^T [dim][key] in LDS as FP16
+// (an FP8 tile made FP16 as it is stored; the next tile's bytes in registers meanwhile); P (FP16) over K's space.
+// S = Q K^T: a thread 4 queries x 4 keys; O = P V: 4 queries x 8 dims; v_dot2_f32_f16, FP32 sums.
+typedef _Float16 g906fa_h2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ float g906fa_dot2(uint32_t a, uint32_t b, float c) {
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(g906fa_h2, a), __builtin_bit_cast(g906fa_h2, b), c, false);
+}
+        for (int c = 0; c < 8; ++c) op[16 * c] = o[a][c];
+        if (tk == 0) ml_part[((size_t) split * Tq + i) * H + h] = make_float2(m[a], la);
+    }
+}
 static bool g906fa_on() {
     static const int on = getenv("IK2_G906_FA") ? atoi(getenv("IK2_G906_FA")) : 1;
     return on != 0;
 }
-static bool g906fa_run(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV, int Tq,
-                       int qpos0, float qk_scale, float v_inv, const float* bias, int extent, int window,
-                       const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_split,
-                       cudaStream_t s, const int* page_table) {
-    if (!g906fa_on() || (q_ld & 7) || H % KV) return false;
-    static const int ns_env = getenv("IK2_G906_FA_SPLIT") ? atoi(getenv("IK2_G906_FA_SPLIT")) : 0;
-    if (ns_env > 0) n_split = ns_env;
-    const size_t per_split = (size_t) Tq * H * (kFaD + 2);
-    n_split = std::max(1, std::min<int>(n_split, (int) (scratch_floats / per_split)));
-    float* o_part = scratch;
-    float2* ml_part = (float2*) (scratch + (size_t) n_split * Tq * H * kFaD);
-    const dim3 grid((unsigned) ((Tq + G906FA_BM - 1) / G906FA_BM), (unsigned) H, (unsigned) n_split);
-    g906fa_kernel<KVT><<<grid, 256, 0, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
-                                            window, n_split, o_part, ml_part, page_table);
-    check("g906fa");
-    attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
-                                                                                 out, o_ld, v_inv);
-    check("g906fa_combine");
-    return true;
+__device__ __forceinline__ uint32_t g906_pair_lo(uint32_t s) {   // FP16 bits of e2m1 low nibbles of bytes 0, 1
+    const uint32_t sel = (s << 4) & 0x7070u;
+    const uint32_t sgn = ((s & 8u) << 12) | ((s & 0x800u) << 20);
+    return __byte_perm(0x42403c00u, 0x4a484644u, sel) | sgn;
+__device__ __forceinline__ uint32_t g906_pair_hi(uint32_t s) {   // ... high nibbles
+    const uint32_t sel = s & 0x7070u;
+    const uint32_t sgn = ((s & 0x80u) << 8) | ((s & 0x8000u) << 16);
+    return __byte_perm(0x42403c00u, 0x4a484644u, sel) | sgn;
+}
+__device__ __forceinline__ uint32_t g906_f2h2(float a, float b) {
+    const g906_h2 v = {(_Float16) a, (_Float16) b};
+    return __builtin_bit_cast(uint32_t, v);
+}
+// one sub-block: codes q0 (bytes 0-3), q1 (bytes 4-7); pairs p = 0..7 are values (2p, 2p + 1)
+template <bool TwoLimb>
+__device__ __forceinline__ float g906_sub(uint32_t q0, uint32_t q1, const uint32_t* xh, const uint32_t* xl) {
+    const uint32_t w[8] = {g906_pair_lo(q0), g906_pair_lo(q0 >> 16), g906_pair_lo(q1), g906_pair_lo(q1 >> 16),
+                           g906_pair_hi(q0), g906_pair_hi(q0 >> 16), g906_pair_hi(q1), g906_pair_hi(q1 >> 16)};
+    float a = 0.0f;
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        a = g906_dot2(w[p], xh[p], a);
+        if (TwoLimb) a = g906_dot2(w[p], xl[p], a);
+    }
+    return a;
+}
+__device__ __forceinline__ float g906_hsum(float v) {
+#pragma unroll
+    for (int m = 16; m; m >>= 1) v += __shfl_xor(v, m, 32);
+    return v;
+}
+// codes of sub-block (w - 1) / 2, half (w - 1) & 1).  The activations sit in LDS arranged per (sub-block, half) - the
+// 8 values a code dword multiplies, as four FP16 pairs (two limbs for gate / up) - so a dword is 4 v_perm decodes and
+// 4 (8) v_dot2_f32_f16.  Low VGPR use: many waves per SIMD to keep HBM busy.
+// the 8 value indices (in pair order) that code dword half hf multiplies: q0 -> 0,1,2,3,8,9,10,11; q1 -> 4..7,12..15
+__device__ __forceinline__ int g906b_vidx(int hf, int k) { return (k < 4 ? k : k + 4) + 4 * hf; }
+
+template <bool TwoLimb>
+__device__ __forceinline__ void g906b_fill(const float* xf, const uint16_t* xh16, int K, uint4* xs) {
+    const int ne = (K >> 4) * 2;
+    for (int e = threadIdx.x; e < ne; e += blockDim.x) {
+        const int sb = e >> 1, hf = e & 1;
+        uint32_t hi[4], lo[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int i0 = sb * 16 + g906b_vidx(hf, 2 * p), i1 = sb * 16 + g906b_vidx(hf, 2 * p + 1);
+            if (TwoLimb) {
+                const float a = xf[i0], b = xf[i1];
+                const g906_h2 h = {(_Float16) a, (_Float16) b};
+                hi[p] = __builtin_bit_cast(uint32_t, h);
+                lo[p] = g906_f2h2(a - (float) h.x, b - (float) h.y);
+            } else {
+                hi[p] = (uint32_t) xh16[i0] | ((uint32_t) xh16[i1] << 16);
+            }
+        }
+        if (TwoLimb) {
+            xs[2 * e] = make_uint4(hi[0], hi[1], hi[2], hi[3]);
+            xs[2 * e + 1] = make_uint4(lo[0], lo[1], lo[2], lo[3]);
+        } else {
+            xs[e] = make_uint4(hi[0], hi[1], hi[2], hi[3]);
+        }
+    }
+}
+// one code dword q (word w >= 1 of block blk, the scale dword sw) against its LDS entry; w == 0 contributes 0
+template <bool TwoLimb>
+__device__ __forceinline__ float g906b_word(uint32_t q, int blk, int w, uint32_t sw, const uint4* xs) {
+    const int j = w > 0 ? w - 1 : 0;
+    const int e = (4 * blk + (j >> 1)) * 2 + (j & 1);
+    q = w > 0 ? q : 0u;
+    const uint32_t w0 = g906_pair_lo(q), w1 = g906_pair_lo(q >> 16), w2 = g906_pair_hi(q), w3 = g906_pair_hi(q >> 16);
+    float a;
+    if (TwoLimb) {
+        const uint4 h = xs[2 * e], l = xs[2 * e + 1];
+        a = g906_dot2(w0, h.x, 0.0f); a = g906_dot2(w1, h.y, a); a = g906_dot2(w2, h.z, a); a = g906_dot2(w3, h.w, a);
+        a = g906_dot2(w0, l.x, a); a = g906_dot2(w1, l.y, a); a = g906_dot2(w2, l.z, a); a = g906_dot2(w3, l.w, a);
+    } else {
+        const uint4 h = xs[e];
+        a = g906_dot2(w0, h.x, 0.0f); a = g906_dot2(w1, h.y, a); a = g906_dot2(w2, h.z, a); a = g906_dot2(w3, h.w, a);
+    }
+    return a * ue4m3((uint8_t) (sw >> (8 * (j >> 1))));
 }
 struct G906Chunk { uint32_t v[CW]; };
+    return c;
+}
+// a row's dot: chunks c = lane + 32 it; the chunk spans blocks blk0 and maybe blk0 + 1, their scale dwords loaded
+template <int CW, bool TwoLimb>
+__device__ __forceinline__ float g906b_row(const uint8_t* wr, int nd, int lane, const uint4* xs) {
+    const int nchunk = nd / CW;
+    float acc = 0.0f;
+    for (int c = lane; c < nchunk; c += 32) {
+        const G906Chunk<CW> ch = g906b_load<CW>(wr + (size_t) c * CW * 4);
+        const int d0 = c * CW, blk0 = d0 / 9;
+        const uint32_t s0 = __ldg((const uint32_t*) (wr + (size_t) blk0 * 36));
+        const int last = (d0 + CW - 1) / 9;
+        const uint32_t s1 = last != blk0 ? __ldg((const uint32_t*) (wr + (size_t) last * 36)) : s0;
+#pragma unroll
+        for (int k = 0; k < CW; ++k) {
+            const int d = d0 + k, blk = d / 9, w = d - 9 * blk;
+            acc += g906b_word<TwoLimb>(ch.v[k], blk, w, blk == blk0 ? s0 : s1, xs);
+        }
+    }
+    return acc;
+}
+        a = g906_hsum(a);
+        if (lane == 0) y[(size_t) s * C + r] = a;
+    }
+}
 static int g906_ver() {
     static const int v = getenv("IK2_G906") ? atoi(getenv("IK2_G906")) : 6;
     return v;
@@ -105,6 +215,38 @@ struct G906Row {
     G906Chunk<CW> ch[MAXIT];
     uint32_t s0[MAXIT], s1[MAXIT];
 };
+template <int CW, int MAXIT>
+__device__ __forceinline__ void g906c_load(const uint8_t* wr, int nchunk, int lane, G906Row<CW, MAXIT>& R) {
+#pragma unroll
+    for (int it = 0; it < MAXIT; ++it) {
+        const int c = lane + 32 * it;
+        const int cc = c < nchunk ? c : nchunk - 1;   // (clamped: a valid address; zeroed below)
+        R.ch[it] = g906b_load<CW>(wr + (size_t) cc * CW * 4);
+        const int d0 = cc * CW, blk0 = d0 / 9, last = (d0 + CW - 1) / 9;
+        R.s0[it] = __ldg((const uint32_t*) (wr + (size_t) blk0 * 36));
+        R.s1[it] = __ldg((const uint32_t*) (wr + (size_t) last * 36));
+    }
+}
+template <int CW, int MAXIT, bool TwoLimb>
+__device__ __forceinline__ float g906c_dot(const G906Row<CW, MAXIT>& R, int nchunk, int lane, const uint4* xs) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int it = 0; it < MAXIT; ++it) {
+        const int c = lane + 32 * it;
+        if (c < nchunk) {
+            const int d0 = c * CW, blk0 = d0 / 9;
+#pragma unroll
+            for (int k = 0; k < CW; ++k) {
+                const int d = d0 + k, blk = d / 9, w = d - 9 * blk;
+                acc += g906b_word<TwoLimb>(R.ch[it].v[k], blk, w, blk == blk0 ? R.s0[it] : R.s1[it], xs);
+            }
+        }
+    }
+    return acc;
+}
+    a = g906_hsum(a);
+    if (lane == 0) y[(size_t) s * C + r] = a;
+}
 #define G906C_GU(CW, MI) g906c_gate_up_kernel<CW, MI><<<g, 512, lds, s>>>(blob, tok, eb0, x, C, F, rb, sg, su, gcap, ucap, h, orow, ld)
 static bool g906c_gate_up(const uint8_t* const* blob, const int* tok, int S, size_t eb0, const float* x, int C, int F,
                           const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s,
@@ -138,6 +280,77 @@ static bool g906c_down(const uint8_t* const* blob, int S, size_t off_down, const
     else if (!c16 && mi <= 6) G906C_DN(2, 6); else return false;
     check("g906c_down");
     return true;
+}
+// v_perm into a byte table (+ one for the negatives, a v_bfi on the sign bits) and v_dot4_i32_i8 against the
+// activations quantized per 16-value sub-block to two int8 limbs (q = round(x * 16256 / max|x|), q = 128 hi + lo;
+// the scheme of nv_input / pack_limbs).  LDS: per (sub-block, half) a uint4 {hi of values A, hi of B, lo A, lo B}
+// (A = the 4 values a code dword's low nibbles multiply, B = the high nibbles') + one float scale per sub-block.
+__device__ __forceinline__ uint32_t g906d_dec(uint32_t n) {   // n: four nibble codes in the low nibbles of 4 bytes
+    const uint32_t sel = n & 0x07070707u;
+    const uint32_t p = __builtin_amdgcn_perm(0x0C080604u, 0x03020100u, sel);
+    const uint32_t m = __builtin_amdgcn_perm(0xF4F8FAFCu, 0xFDFEFF00u, sel);
+    const uint32_t neg = ((n >> 3) & 0x01010101u) * 0xFFu;
+    return (p & ~neg) | (m & neg);
+}
+// LDS fill: entries e = 2 sb + hf (threads loop); scale per sub-block
+template <bool F32In>
+__device__ __forceinline__ void g906d_fill(const float* xf, const uint16_t* xh16, int K, uint4* xs, float* xsc) {
+    const int ne = (K >> 4) * 2;
+    for (int e = threadIdx.x; e < ne; e += blockDim.x) {
+        const int sb = e >> 1, hf = e & 1;
+        float v[16], mx = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            v[j] = F32In ? xf[sb * 16 + j] : h2f(xh16[sb * 16 + j]);
+            mx = fmaxf(mx, fabsf(v[j]));
+        }
+        const float inv = mx > 0.0f ? 16256.0f / mx : 0.0f;
+        uint32_t hA = 0, hB = 0, lA = 0, lB = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int qa = __float2int_rn(v[4 * hf + t] * inv), qb = __float2int_rn(v[8 + 4 * hf + t] * inv);
+            const int ha = (qa + 64) >> 7, hb = (qb + 64) >> 7;
+            hA |= (uint32_t) (uint8_t) ha << (8 * t);
+            hB |= (uint32_t) (uint8_t) hb << (8 * t);
+            lA |= (uint32_t) (uint8_t) (qa - 128 * ha) << (8 * t);
+            lB |= (uint32_t) (uint8_t) (qb - 128 * hb) << (8 * t);
+        }
+        xs[e] = make_uint4(hA, hB, lA, lB);
+        if (hf == 0) xsc[sb] = mx / 16256.0f;
+    }
+}
+__device__ __forceinline__ float g906d_word(uint32_t q, int blk, int w, uint32_t sw, const uint4* xs, const float* xsc) {
+    const int j = w > 0 ? w - 1 : 0;
+    const int sb = 4 * blk + (j >> 1);
+    const uint4 x = xs[2 * sb + (j & 1)];
+    q = w > 0 ? q : 0u;
+    const int wa = (int) g906d_dec(q & 0x0F0F0F0Fu), wb = (int) g906d_dec((q >> 4) & 0x0F0F0F0Fu);
+    int ih = __builtin_amdgcn_sdot4(wa, (int) x.x, 0, false);
+    ih = __builtin_amdgcn_sdot4(wb, (int) x.y, ih, false);
+    int il = __builtin_amdgcn_sdot4(wa, (int) x.z, 0, false);
+    il = __builtin_amdgcn_sdot4(wb, (int) x.w, il, false);
+    return (float) (ih * 128 + il) * (xsc[sb] * ue4m3((uint8_t) (sw >> (8 * (j >> 1)))));
+}
+template <int CW, int MAXIT>
+__device__ __forceinline__ float g906d_dot(const G906Row<CW, MAXIT>& R, int nchunk, int lane, const uint4* xs,
+                                           const float* xsc) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int it = 0; it < MAXIT; ++it) {
+        const int c = lane + 32 * it;
+        if (c < nchunk) {
+            const int d0 = c * CW, blk0 = d0 / 9;
+#pragma unroll
+            for (int k = 0; k < CW; ++k) {
+                const int d = d0 + k, blk = d / 9, w = d - 9 * blk;
+                acc += g906d_word(R.ch[it].v[k], blk, w, blk == blk0 ? R.s0[it] : R.s1[it], xs, xsc);
+            }
+        }
+    }
+    return acc;
+}
+    a = g906_hsum(a);
+    if (lane == 0) y[(size_t) s * C + r] = a;
 }
 #define G906D_GU(CW, MI) g906d_gate_up_kernel<CW, MI><<<g, 512, lds, s>>>(blob, tok, eb0, x, C, F, rb, sg, su, gcap, ucap, h, orow, ld)
 static bool g906d_gate_up(const uint8_t* const* blob, const int* tok, int S, size_t eb0, const float* x, int C, int F,
@@ -173,22 +386,157 @@ static bool g906d_down(const uint8_t* const* blob, int S, size_t off_down, const
     check("g906d_down");
     return true;
 }
+
 static int g906_wg() {
     static const int v = getenv("IK2_G906_WG") ? atoi(getenv("IK2_G906_WG")) : 256;
     return v;
 }
 #define G906_X4 1
-typedef unsigned int g906_u4 __attribute__((ext_vector_type(4)));
-// ---- gfx906 v5: int8, a lane owns whole 36-byte blocks (G lanes a row, NB blocks a lane, nblk = G * NB), so the
-// block's scale word, its 4 sub-block scales and the word -> activation mapping are all compile-time.  Codes ->
 // int8 with v_perm (positive table, negative table, sign mask from v_perm's 0x0C/0x0D constant selectors) and
 // v_dot4_i32_i8 against two int8 limbs.  LDS a block: 8 uint4 {hiA, hiB, loA, loB} (word w = 1..8) + 1 float4 of
+// the sub-block activation scales x 2^119 (ue4m3 = as_float(b << 20) x 2^119, denormal-exact) = 9 uint4 = 36
+// dwords (stride 4 mod 32 banks).
+__device__ __forceinline__ int g906e_dec(uint32_t sel7, uint32_t sgn) {   // sel7: codes & 7 a byte; sgn: bit0 a byte
+    const uint32_t p = __builtin_amdgcn_perm(0x0C080604u, 0x03020100u, sel7);
+    const uint32_t m = __builtin_amdgcn_perm(0xF4F8FAFCu, 0xFDFEFF00u, sel7);
+    const uint32_t neg = __builtin_amdgcn_perm(0u, 0u, sgn | 0x0C0C0C0Cu);   // 0x0C -> 0x00, 0x0D -> 0xFF
+    return (int) ((p & ~neg) | (m & neg));
+}
+template <bool F32In>
+__device__ __forceinline__ void g906e_fill(const float* xf, const uint16_t* xh16, int K, uint4* xs) {
+    const int nsb = K >> 4;
+    for (int sb = threadIdx.x; sb < nsb; sb += blockDim.x) {
+        float v[16], mx = 0.0f;
+        if (F32In) {
+#pragma unroll
+            for (int j = 0; j < 16; j += 4) {
+                const float4 t = *(const float4*) (xf + sb * 16 + j);
+                v[j] = t.x; v[j + 1] = t.y; v[j + 2] = t.z; v[j + 3] = t.w;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; j += 2) {
+                const uint32_t t = *(const uint32_t*) (xh16 + sb * 16 + j);
+                v[j] = h2f((uint16_t) t); v[j + 1] = h2f((uint16_t) (t >> 16));
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 16; ++j) mx = fmaxf(mx, fabsf(v[j]));
+        const float inv = mx > 0.0f ? 16256.0f / mx : 0.0f;
+        const int blk = sb >> 2, sub = sb & 3;
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+            uint32_t hA = 0, hB = 0, lA = 0, lB = 0;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int qa = __float2int_rn(v[4 * hf + t] * inv), qb = __float2int_rn(v[8 + 4 * hf + t] * inv);
+                const int ha = (qa + 64) >> 7, hb = (qb + 64) >> 7;
+                hA |= (uint32_t) (uint8_t) ha << (8 * t);
+                hB |= (uint32_t) (uint8_t) hb << (8 * t);
+                lA |= (uint32_t) (uint8_t) (qa - 128 * ha) << (8 * t);
+                lB |= (uint32_t) (uint8_t) (qb - 128 * hb) << (8 * t);
+            }
+            xs[blk * 9 + 2 * sub + hf] = make_uint4(hA, hB, lA, lB);
+        }
+        ((float*) (xs + blk * 9 + 8))[sub] = mx * (1.0f / 16256.0f);
+    }
+}
 struct G906X16 {
     float v[16];
 };
+template <bool F32In>
+__device__ __forceinline__ void g906e_xld(const float* xf, const uint16_t* xh16, int K, G906X16& X) {
+    const int sb = threadIdx.x;
+    if (sb >= (K >> 4)) return;
+    if (F32In) {
+#pragma unroll
+        for (int j = 0; j < 16; j += 4) {
+            const float4 t = *(const float4*) (xf + sb * 16 + j);
+            X.v[j] = t.x; X.v[j + 1] = t.y; X.v[j + 2] = t.z; X.v[j + 3] = t.w;
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 16; j += 2) {
+            const uint32_t t = *(const uint32_t*) (xh16 + sb * 16 + j);
+            X.v[j] = h2f((uint16_t) t); X.v[j + 1] = h2f((uint16_t) (t >> 16));
+        }
+    }
+}
+__device__ __forceinline__ void g906e_xst(const G906X16& X, int K, uint4* xs) {
+    const int sb = threadIdx.x;
+    if (sb >= (K >> 4)) return;
+    float mx = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) mx = fmaxf(mx, fabsf(X.v[j]));
+    const float inv = mx > 0.0f ? 16256.0f / mx : 0.0f;
+    const int blk = sb >> 2, sub = sb & 3;
+#pragma unroll
+    for (int hf = 0; hf < 2; ++hf) {
+        uint32_t hA = 0, hB = 0, lA = 0, lB = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int qa = __float2int_rn(X.v[4 * hf + t] * inv), qb = __float2int_rn(X.v[8 + 4 * hf + t] * inv);
+            const int ha = (qa + 64) >> 7, hb = (qb + 64) >> 7;
+            hA |= (uint32_t) (uint8_t) ha << (8 * t);
+            hB |= (uint32_t) (uint8_t) hb << (8 * t);
+            lA |= (uint32_t) (uint8_t) (qa - 128 * ha) << (8 * t);
+            lB |= (uint32_t) (uint8_t) (qb - 128 * hb) << (8 * t);
+        }
+        xs[blk * 9 + 2 * sub + hf] = make_uint4(hA, hB, lA, lB);
+    }
+    ((float*) (xs + blk * 9 + 8))[sub] = mx * (1.0f / 16256.0f);
+}
 struct G906Blk {
     uint32_t d[9];
 };
+__device__ __forceinline__ void g906e_ld(const uint8_t* p, G906Blk& B) {
+#if G906_X4
+    // (dwordx4 at a dword-aligned address: gfx9's unaligned mode; 3 loads a block, not 9)
+    const g906_u4 a = *(const g906_u4*) p, b = *(const g906_u4*) (p + 16);
+    B.d[0] = a.x, B.d[1] = a.y, B.d[2] = a.z, B.d[3] = a.w, B.d[4] = b.x, B.d[5] = b.y, B.d[6] = b.z, B.d[7] = b.w;
+    B.d[8] = __ldg((const uint32_t*) (p + 32));
+#else
+    const uint32_t* q = (const uint32_t*) p;
+#pragma unroll
+    for (int i = 0; i < 9; ++i) B.d[i] = __ldg(q + i);
+#endif
+}
+__device__ __forceinline__ float g906e_blk(const G906Blk& B, const uint4* xb) {
+    const uint4 sc = xb[8];
+    const float xsc[4] = {__uint_as_float(sc.x), __uint_as_float(sc.y), __uint_as_float(sc.z), __uint_as_float(sc.w)};
+    float acc = 0.0f;
+#pragma unroll
+    for (int sub = 0; sub < 4; ++sub) {
+        int ih = 0, il = 0;
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+            const uint32_t q = B.d[1 + 2 * sub + hf];
+            const uint4 x = xb[2 * sub + hf];
+            const int wa = g906e_dec(q & 0x07070707u, (q >> 3) & 0x01010101u);
+            const int wb = g906e_dec((q >> 4) & 0x07070707u, (q >> 7) & 0x01010101u);
+            ih = __builtin_amdgcn_sdot4(wa, (int) x.x, ih, false);
+            ih = __builtin_amdgcn_sdot4(wb, (int) x.y, ih, false);
+            il = __builtin_amdgcn_sdot4(wa, (int) x.z, il, false);
+            il = __builtin_amdgcn_sdot4(wb, (int) x.w, il, false);
+        }
+        const float ws = ue4m3((uint8_t) (B.d[0] >> (8 * sub)));
+        acc = fmaf((float) (ih * 128 + il), ws * xsc[sub], acc);
+    }
+    return acc;
+}
+// a row's G partial sums -> lane (row's first): LDS scratch red[512]
+__device__ __forceinline__ float g906e_rsum(float v, float* red, int G, int part) {
+    red[threadIdx.x] = v;
+    __syncthreads();
+    float s = 0.0f;
+    if (part == 0)
+        for (int i = 0; i < G; ++i) s += red[threadIdx.x + i];
+    return s;
+}
+    a = g906e_rsum(a, red, G, part);
+    if (live && part == 0 && r < C) y[(size_t) s * C + r] = a;
+}
+// (G, NB) for nblk blocks a row: G * NB == nblk, G <= 16, the fewest idle lanes
 static bool g906e_pick(int nblk, int& G, int& NB) {
     static const int cand[][2] = {{12, 3}, {9, 2}, {16, 2}, {16, 1}, {8, 1}, {12, 1}, {9, 1}, {16, 3}, {16, 4},
                                   {12, 2}, {12, 4}, {9, 3}, {9, 4}, {8, 2}, {8, 3}, {8, 4}};
@@ -230,9 +578,90 @@ static bool g906e_down(const uint8_t* const* blob, int S, size_t off_down, const
     check("g906e_down");
     return true;
 }
+// codes are dwords 9..16, block A's are 2 bytes off (v_alignbit), the scales are d0's low and d8's high half.
+// Activations: two int8 limbs a 32 in LDS, a pair = 9 uint4 {hiA0, hiA1, loA0, loA1, hiB0, hiB1, loB0, loB1,
+// {sA, sB}} (stride 36 dwords: 4 mod 32 banks).
+template <bool F32In>
+__device__ __forceinline__ void g906k_fill(const float* xf, const uint16_t* xh16, int K, uint4* xs) {
+    const int ng = K >> 5;
+    for (int gi = threadIdx.x; gi < ng; gi += blockDim.x) {
+        float v[32], mx = 0.0f;
+        if (F32In) {
+#pragma unroll
+            for (int j = 0; j < 32; j += 4) {
+                const float4 t = *(const float4*) (xf + gi * 32 + j);
+                v[j] = t.x; v[j + 1] = t.y; v[j + 2] = t.z; v[j + 3] = t.w;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 32; j += 2) {
+                const uint32_t t = *(const uint32_t*) (xh16 + gi * 32 + j);
+                v[j] = h2f((uint16_t) t); v[j + 1] = h2f((uint16_t) (t >> 16));
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 32; ++j) mx = fmaxf(mx, fabsf(v[j]));
+        const float inv = mx > 0.0f ? 16256.0f / mx : 0.0f;
+        uint32_t hi[8], lo[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            uint32_t h = 0, l = 0;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int q = __float2int_rn(v[4 * k + t] * inv), hh = (q + 64) >> 7;
+                h |= (uint32_t) (uint8_t) hh << (8 * t);
+                l |= (uint32_t) (uint8_t) (q - 128 * hh) << (8 * t);
+            }
+            hi[k] = h, lo[k] = l;
+        }
+        uint4* e = xs + (gi >> 1) * 9 + (gi & 1) * 4;
+        e[0] = make_uint4(hi[0], hi[1], hi[2], hi[3]);
+        e[1] = make_uint4(hi[4], hi[5], hi[6], hi[7]);
+        e[2] = make_uint4(lo[0], lo[1], lo[2], lo[3]);
+        e[3] = make_uint4(lo[4], lo[5], lo[6], lo[7]);
+        ((float*) (xs + (gi >> 1) * 9 + 8))[gi & 1] = mx * (1.0f / 16256.0f);
+    }
+}
 struct G906Pair {
     uint32_t d[17];
 };
+__device__ __forceinline__ void g906k_ld(const uint8_t* p, G906Pair& B) {
+#if G906_X4
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const g906_u4 a = *(const g906_u4*) (p + 16 * k);
+        B.d[4 * k] = a.x, B.d[4 * k + 1] = a.y, B.d[4 * k + 2] = a.z, B.d[4 * k + 3] = a.w;
+    }
+    B.d[16] = __ldg((const uint32_t*) (p + 64));
+#else
+    const uint32_t* q = (const uint32_t*) p;
+#pragma unroll
+    for (int i = 0; i < 17; ++i) B.d[i] = __ldg(q + i);
+#endif
+}
+__device__ __forceinline__ int g906k_dot8(const uint32_t* w, uint4 x0, uint4 x1) {
+    int a = __builtin_amdgcn_sdot4((int) w[0], (int) x0.x, 0, false);
+    a = __builtin_amdgcn_sdot4((int) w[1], (int) x0.y, a, false);
+    a = __builtin_amdgcn_sdot4((int) w[2], (int) x0.z, a, false);
+    a = __builtin_amdgcn_sdot4((int) w[3], (int) x0.w, a, false);
+    a = __builtin_amdgcn_sdot4((int) w[4], (int) x1.x, a, false);
+    a = __builtin_amdgcn_sdot4((int) w[5], (int) x1.y, a, false);
+    a = __builtin_amdgcn_sdot4((int) w[6], (int) x1.z, a, false);
+    return __builtin_amdgcn_sdot4((int) w[7], (int) x1.w, a, false);
+}
+__device__ __forceinline__ float g906k_pair(const G906Pair& B, const uint4* xb) {
+    uint32_t qa[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) qa[i] = __builtin_amdgcn_alignbit(B.d[i + 1], B.d[i], 16);
+    const uint4 sc = xb[8];
+    const int ia = g906k_dot8(qa, xb[0], xb[1]) * 128 + g906k_dot8(qa, xb[2], xb[3]);
+    const int ib = g906k_dot8(B.d + 9, xb[4], xb[5]) * 128 + g906k_dot8(B.d + 9, xb[6], xb[7]);
+    const float da = h2f((uint16_t) B.d[0]), db = h2f((uint16_t) (B.d[8] >> 16));
+    return (float) ia * (da * __uint_as_float(sc.x)) + (float) ib * (db * __uint_as_float(sc.y));
+}
+        }
+    }
+}
 #define G906F_GU(GG, NN) g906f_gate_up_kernel<GG, NN><<<g, wg, lds, s>>>(blob, tok, eb0, x, C, F, rb, sg, su, gcap, ucap, h, orow, ld)
 static bool g906f_gate_up(const uint8_t* const* blob, const int* tok, int S, size_t eb0, const float* x, int C, int F,
                           const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s,
@@ -254,51 +683,8 @@ static bool g906f_gate_up(const uint8_t* const* blob, const int* tok, int S, siz
     check("g906f_gate_up");
     return true;
 }
-static bool g906k_pick(int npair, int& G, int& NP);
-template <int G, int NP>
-__global__ void __launch_bounds__(512) g906kg_gate_up_kernel(const uint8_t* const* blob, const int* gn, const int* gtok,
-                                                             const int* grow, size_t eb0, const float* x, int C, int F,
-                                                             size_t rb, const float* sg, const float* su, float gcap,
-                                                             float ucap, uint16_t* h, int h_ld) {
-    extern __shared__ uint4 g906_xs[];
-    constexpr int RW = 64 / G;
-    const int gi = blockIdx.y, ng = gn[gi];
-    if (ng <= 0) return;
-    float* red = (float*) (g906_xs + (C >> 6) * 9);
-    const int lane = threadIdx.x & 63, wv = threadIdx.x >> 6;
-    const int grp = lane / G, part = lane - grp * G;
-    const bool live = grp < RW;
-    const int r = (blockIdx.x * (int) (blockDim.x >> 6) + wv) * RW + grp;
-    const int rr = (live && r < F) ? r : F - 1;
-    const uint8_t* bg = blob[gi] + (size_t) rr * rb;
-    const int* tk = gtok + gi * kGroupMax;
-    const int* rw = grow + gi * kGroupMax;
-    G906Pair Bg[NP], Bu[NP];
-#pragma unroll
-    for (int i = 0; i < NP; ++i) {
-        g906k_ld(bg + (size_t) (part + G * i) * 68, Bg[i]);
-        g906k_ld(bg + eb0 + (size_t) (part + G * i) * 68, Bu[i]);
-    }
-#pragma unroll 1
-    for (int j = 0; j < ng; ++j) {
-        if (j > 0) __syncthreads();   // (the previous member's x and red read)
-        g906k_fill<true>(x + (size_t) tk[j] * C, nullptr, C, g906_xs);
-        __syncthreads();
-        float ag = 0.0f, au = 0.0f;
-#pragma unroll
-        for (int i = 0; i < NP; ++i) {
-            const uint4* xb = g906_xs + (part + G * i) * 9;
-            ag += g906k_pair(Bg[i], xb);
-            au += g906k_pair(Bu[i], xb);
-        }
-        ag = g906e_rsum(ag, red, G, part);
-        __syncthreads();
-        au = g906e_rsum(au, red, G, part);
-        const int orow = rw[j];
-        if (live && part == 0 && r < F) {
-            const float g = ag * (sg ? sg[orow] : 1.0f), u = au * (su ? su[orow] : 1.0f);
-            h[(size_t) orow * h_ld + r] = f2h(gcap * tanhf(g / gcap) * (1.0f / (1.0f + expf(-g))) * ucap * tanhf(u / ucap));
-        }
+        a = g906e_rsum(a, red, G, part);
+        if (live && part == 0 && r < C) y[(size_t) rw[j] * C + r] = a;
     }
 }
 static bool g906kg_gate_up(const uint8_t* const* blob, const int* gn, const int* gtok, const int* grow, int NG,
@@ -336,11 +722,10 @@ static bool g906kg_down(const uint8_t* const* blob, const int* gn, const int* gr
     check("g906kg_down");
     return true;
 }
-template <int G, int NB>
-__global__ void __launch_bounds__(512) g906fg_gate_up_kernel(const uint8_t* const* blob, const int* gn, const int* gtok,
-                                                             const int* grow, size_t eb0, const float* x, int C, int F,
-                                                             size_t rb, const float* sg, const float* su, float gcap,
-                                                             float ucap, uint16_t* h, int h_ld) {
+        a = g906e_rsum(a, red, G, part);
+        if (live && part == 0 && r < C) y[(size_t) rw[j] * C + r] = a;
+    }
+}
 static bool g906g_on() {
     static const bool on = !getenv("IK2_G906_GROUP") || atoi(getenv("IK2_G906_GROUP"));
     return on;
@@ -372,6 +757,7 @@ bool g906_group_gate_up(const uint8_t* const* blob, const int* gn, const int* gt
     check("g906fg_gate_up");
     return true;
 }
+#undef G906FG_GU
 #define G906EG_DN(GG, NN) g906eg_down_kernel<GG, NN><<<g, g906_wg(), lds, s>>>(blob, gn, grow, off_down, h, C, F, rb, y)
 bool g906_group_down(const uint8_t* const* blob, const int* gn, const int* grow, int NG, int ty_down, size_t off_down,
                      const uint16_t* h, int C, int F, float* y, cudaStream_t s) {
@@ -390,6 +776,7 @@ bool g906_group_down(const uint8_t* const* blob, const int* gn, const int* grow,
     check("g906eg_down");
     return true;
 }
+#undef G906EG_DN
 static bool g906k_pick(int npair, int& G, int& NP) {
     static const int cand[][2] = {{18, 2}, {9, 2}, {16, 2}, {16, 1}, {8, 1}, {12, 1}, {9, 1}, {12, 2}, {8, 2}};
     for (auto& c : cand)
@@ -430,10 +817,12 @@ static bool g906k_down(const uint8_t* const* blob, int S, size_t off_down, const
     check("g906k_down");
     return true;
 }
+
 static bool g906_on() {
     static const int on = !(getenv("IK2_G906") && !atoi(getenv("IK2_G906")));
     return on != 0;
 }
+// true when it ran
 static bool g906_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                          const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
                          uint16_t* h, cudaStream_t s, const int* orow, int h_ld) {
@@ -482,157 +871,91 @@ static bool g906_down(const uint8_t* const* blob, int S, int ty_down, size_t off
     check("g906_down_nv");
     return true;
 }
-static bool g906da_on() {
-    static const int on = getenv("IK2_G906_DA") ? atoi(getenv("IK2_G906_DA")) : 1;
-    return on != 0;
+// R q's (LDS, broadcast), the relative bias, the mask; (2) the block's max per head, P = exp(l - m) into LDS;
+// (3) a lane a pair of dims x a quarter of the keys (a wave a quarter): o += P V, the V rows read coalesced.
+constexpr int G906DA_R = 4;
 template <class KV>
-static bool g906da_launch(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H, int Hkv,
-                          int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent,
-                          int window, float* part, int P, const int* pos_d, const int* page_table, cudaStream_t s,
-                          const float* sink, float v_inv_scale, float* out) {
-    if (!g906da_on() || H % Hkv || H / Hkv > G906DA_R || d_rel > 32 || (((uintptr_t) q) & 15)) return false;
-    // (a sliding layer never sees more than window keys: its splits sized for that; the layout keeps stride P)
-    const int Pg = window < (1 << 30) ? std::max(1, std::min(P, (window + 63) / 64)) : P;
-    const dim3 g((unsigned) Hkv, (unsigned) Pg);
-    static const int de_on = getenv("IK2_G906_DE") ? atoi(getenv("IK2_G906_DE")) : 1;
+__device__ __forceinline__ void g906da_row16(const KV* p, float* v) {   // 16 values of a cache row
     if constexpr (sizeof(KV) == 1) {
-        if (de_on && H / Hkv == 3 && Pg <= 128 && (page_table || kv_cap == 0 || kv_cap >= 64)) {
-            g906de_kernel<KV, 3><<<g, 256, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
-                                                    extent, window, part, pos_d, page_table, P);
-            check("g906de");
-            g906dc_kernel<<<(unsigned) H, 128, 0, s>>>(sink, part, H, P, v_inv_scale, out, k0, nk, window, pos_d, Pg,
-                                                        256);
-            check("g906dc");
-            return true;
+        const uint4 w = __ldg((const uint4*) p);
+        const uint32_t u[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 a = e4m3fnx2_to_f2((uint16_t) (u[i] & 0xFFFFu)), b = e4m3fnx2_to_f2((uint16_t) (u[i] >> 16));
+            v[4 * i] = a.x, v[4 * i + 1] = a.y, v[4 * i + 2] = b.x, v[4 * i + 3] = b.y;
+        }
+    } else {
+        const uint4 w0 = __ldg((const uint4*) p), w1 = __ldg((const uint4*) p + 1);
+        const uint32_t u[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float2 a = u32_to_f2(u[i]);
+            v[2 * i] = a.x, v[2 * i + 1] = a.y;
         }
     }
+}
+}
+// v5: e4m3 -> FP16 by a shift (FP16 = e4m3 bits placed in the FP16 fields = value / 256, subnormals exact; the 256
+// goes into the scales).  4 waves a block, a wave a tile of 64 keys: Q K^T a lane a key (v_dot2 against q pairs in
+// LDS), the wave's online softmax, P as FP16 in the wave's LDS, P V a lane a pair of dims with v_dot2 over key pairs.
+__device__ __forceinline__ void g906_e8h(uint32_t w, uint32_t& lo, uint32_t& hi) {
+    const uint32_t m = w & 0x7F7F7F7Fu, s = w & 0x80808080u;
+    lo = (__builtin_amdgcn_perm(0u, m, 0x04010400u) << 7) | __builtin_amdgcn_perm(0u, s, 0x01040004u);
+    hi = (__builtin_amdgcn_perm(0u, m, 0x04030402u) << 7) | __builtin_amdgcn_perm(0u, s, 0x03040204u);
+}
+typedef uint32_t g906_u4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ void g906_wave_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
 #define G906DA_L(RR) g906da_kernel<KV, RR><<<g, 256, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj,                                                            d_rel, extent, window, part, pos_d, page_table, P)
-    switch (H / Hkv) {
-        case 1: G906DA_L(1); break;
-        case 2: G906DA_L(2); break;
-        case 3: G906DA_L(3); break;
-        default: G906DA_L(4); break;
-    }
 #undef G906DA_L
-    check("g906da");
-    g906dc_kernel<<<(unsigned) H, 128, 0, s>>>(sink, part, H, P, v_inv_scale, out, k0, nk, window, pos_d, Pg, 64);
-    check("g906dc");
-    return true;
-#endif
-template <class KV>
-void attn_decode_impl(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc, int kv_cap, int H,
-                      int Hkv, int D, int k0, int nk, int qpos, float qk_scale, float v_inv_scale, const float* proj,
-                      int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
-                      const int* page_table = nullptr) {
-    if (D != 128 || d_rel > 32) {
-        std::fprintf(stderr, "ik2::k::attn_decode: D %d, d_rel %d\n", D, d_rel);
-        std::abort();
-    // Flash-Decode splits over chunks of ~64 keys, up to 128 blocks per head (partials written directly to scratch)
-    const int P = std::min(128, std::max(1, (nk + 63) / 64));
-    if (P == 1) {
-        attn_decode_kernel<KV><<<H, 128, 0, s>>>(q, r, sink, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale,
-                                                   v_inv_scale, proj, d_rel, extent, window, out, page_table);
-        check("attn_decode");
-    float* part = scratch;
-#if defined(STRATA_USE_HIP)
-    if (g906da_launch<KV>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel, extent, window, part, P,
-                          nullptr, page_table, s, sink, v_inv_scale, out))
-        return;
-#endif
-    attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
-                                                      extent, window, part, nullptr, page_table);
-    check("attn_decode_split");
-    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
-    check("attn_decode_combine");
-void attn_decode(const float* q, const float* r, const float* sink, const float* kc, const float* vc, int H, int Hkv,
-                 int D, int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent, int window,
-                 float* scratch, float* out, cudaStream_t s, const int* page_table) {
-    attn_decode_impl(q, r, sink, kc, vc, 0, H, Hkv, D, k0, nk, qpos, qk_scale, 1.0f, proj, d_rel, extent, window,
-                     scratch, out, s, page_table);
-void attn_decode_f16(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
-                     int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale, const float* proj,
-                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
-                     const int* page_table) {
-    attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, 1.0f, proj, d_rel, extent, window,
-                     scratch, out, s, page_table);
-void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
-                     int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
-                     float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                     float* out, cudaStream_t s, const int* page_table) {
-    attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, v_inv_scale, proj, d_rel, extent,
-                     window, scratch, out, s, page_table);
 #if defined(STRATA_USE_HIP)
 // ---- gfx906 dense: Q8_0 (int8 [N][K], fp16 scale a 32) by x quantized in the block's LDS to two int8 limbs a 32
 // (q = round(x * 16256 / max), 128 hi + lo), v_dot4_i32_i8; a row a half-wavefront, 16 bytes a lane a chunk, every
 // chunk loaded before any is used.
 __device__ __forceinline__ float g906_wsum64(float v) {
 #pragma unroll
+    for (int o = 32; o > 0; o >>= 1) v += __shfl_xor(v, o, 64);
+    return v;
+}
+}
 struct G906XQ {
     float4 v[3];
 };
-static bool g906q_on() {
-    static const int v = getenv("IK2_G906_DENSE") ? atoi(getenv("IK2_G906_DENSE")) : 1;
-    return v != 0;
-// ---- gfx906 dense Q8_0, persistent: a block fills its LDS once, then walks rows (blocks side by side on
-// neighbouring rows), the next row's chunks loaded while the current row is summed
-template <int MAXIT>
-__device__ __forceinline__ void g906q2_ld(const int8_t* q, const uint16_t* d, int K, int row, int lane, uint4* w,
-                                          uint16_t* ds) {
-    const int nch = K >> 4;
-    const uint4* qr = (const uint4*) (q + (size_t) row * K);
-    const uint16_t* dr = d + (size_t) row * (K >> 5);
+__device__ __forceinline__ void g906q_xld(const float* x, int K, G906XQ& X) {
 #pragma unroll
-    for (int it = 0; it < MAXIT; ++it) {
-        const int c = lane + 32 * it, cc = c < nch ? c : nch - 1;
-        w[it] = __ldg(qr + cc);
-        ds[it] = __ldg(dr + (cc >> 1));
+    for (int k = 0; k < 3; ++k) {
+        const int t = threadIdx.x + k * blockDim.x;
+        X.v[k] = t < (K >> 2) ? *(const float4*) (x + 4 * t) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
-template <int MAXIT>
-__device__ __forceinline__ float g906q2_dot(const uint4* w, const uint16_t* ds, int K, int lane, const uint32_t* hi,
-                                            const uint32_t* lo, const float* xsc) {
-    const int nch = K >> 4;
-    float acc = 0.0f;
-#pragma unroll
-    for (int it = 0; it < MAXIT; ++it) {
-        const int c = lane + 32 * it;
-        if (c < nch) {
-            const uint4 xh = ((const uint4*) hi)[c], xl = ((const uint4*) lo)[c];
-            int ih = __builtin_amdgcn_sdot4((int) w[it].x, (int) xh.x, 0, false);
-            ih = __builtin_amdgcn_sdot4((int) w[it].y, (int) xh.y, ih, false);
-            ih = __builtin_amdgcn_sdot4((int) w[it].z, (int) xh.z, ih, false);
-            ih = __builtin_amdgcn_sdot4((int) w[it].w, (int) xh.w, ih, false);
-            int il = __builtin_amdgcn_sdot4((int) w[it].x, (int) xl.x, 0, false);
-            il = __builtin_amdgcn_sdot4((int) w[it].y, (int) xl.y, il, false);
-            il = __builtin_amdgcn_sdot4((int) w[it].z, (int) xl.z, il, false);
-            il = __builtin_amdgcn_sdot4((int) w[it].w, (int) xl.w, il, false);
-            acc = fmaf((float) (ih * 128 + il), xsc[c >> 1] * h2f(ds[it]), acc);
-        }
-    return g906_hsum(acc);
 }
-template <int MAXIT>
-__global__ void __launch_bounds__(256) g906q2_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d,
-                                                     int N, int K, const float* __restrict__ x, float* y, MvConv c0,
-                                                     MvConv c1) {
-    extern __shared__ uint32_t g906q_sm[];
-    uint32_t* hi = g906q_sm;
-    uint32_t* lo = hi + (K >> 2);
-    float* xsc = (float*) (lo + (K >> 2));
-    const int lane = threadIdx.x & 31, hw = threadIdx.x >> 5;
-    const int step = gridDim.x * 8;
-    int row = blockIdx.x * 8 + hw;
-    uint4 wa[MAXIT], wb[MAXIT];
-    uint16_t da[MAXIT], db[MAXIT];
-    g906q2_ld<MAXIT>(q, d, K, row < N ? row : N - 1, lane, wa, da);
-    g906q_fill(x, K, hi, lo, xsc);
-    __syncthreads();
-    for (; row < N; row += 2 * step) {
-        const int r1 = row + step;
-        g906q2_ld<MAXIT>(q, d, K, r1 < N ? r1 : N - 1, lane, wb, db);
-        float acc = g906q2_dot<MAXIT>(wa, da, K, lane, hi, lo, xsc);
-        if (lane == 0 && !mv_conv_row(c0, row, acc) && !mv_conv_row(c1, row, acc)) y[row] = acc;
-        if (r1 >= N) break;
-        const int r2 = r1 + step;
-        g906q2_ld<MAXIT>(q, d, K, r2 < N ? r2 : N - 1, lane, wa, da);
+__device__ __forceinline__ void g906q_xst(const G906XQ& X, int K, uint32_t* hi, uint32_t* lo, float* xsc) {
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int t = threadIdx.x + k * blockDim.x;
+        if (k * (int) blockDim.x >= (K >> 2)) break;   // (whole waves: K / 4 a multiple of 32)
+        const float4 v = X.v[k];
+        float mx = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+        mx = fmaxf(mx, __shfl_xor(mx, 1, 64));
+        mx = fmaxf(mx, __shfl_xor(mx, 2, 64));
+        mx = fmaxf(mx, __shfl_xor(mx, 4, 64));
+        if (t >= (K >> 2)) continue;
+        const float inv = mx > 0.0f ? 16256.0f / mx : 0.0f;
+        const float vv[4] = {v.x, v.y, v.z, v.w};
+        uint32_t h = 0, l = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int q = __float2int_rn(vv[i] * inv), hh = (q + 64) >> 7;
+            h |= (uint32_t) (uint8_t) hh << (8 * i);
+            l |= (uint32_t) (uint8_t) (q - 128 * hh) << (8 * i);
+        }
+        hi[t] = h;
+        lo[t] = l;
+        if ((t & 7) == 0) xsc[t >> 3] = mx * (1.0f / 16256.0f);
+    }
+}
         acc = g906q2_dot<MAXIT>(wb, db, K, lane, hi, lo, xsc);
         if (lane == 0 && !mv_conv_row(c0, r1, acc) && !mv_conv_row(c1, r1, acc)) y[r1] = acc;
     }
@@ -647,19 +970,6 @@ static int g906_ncu() {
     }
     return n;
 }
-static bool g906q2_mv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
-                      const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
-    static const int bpc = getenv("IK2_G906_QBPC") ? atoi(getenv("IK2_G906_QBPC")) : 0;
-    if (bpc <= 0 || a0.n || a1.n || K % 128 || ((uintptr_t) q & 15) || ((uintptr_t) x & 15)) return false;
-    const int mi = (K / 16 + 31) / 32;
-    const size_t lds = (size_t) K * 2 + (size_t) K / 32 * 4;
-    const int nb = std::min((N + 7) / 8, g906_ncu() * bpc);
-    switch (mi) {
-        case 4: g906q2_kernel<4><<<nb, 256, lds, s>>>(q, d, N, K, x, y, c0, c1); break;
-        case 5: g906q2_kernel<5><<<nb, 256, lds, s>>>(q, d, N, K, x, y, c0, c1); break;
-        case 6: g906q2_kernel<6><<<nb, 256, lds, s>>>(q, d, N, K, x, y, c0, c1); break;
-        default: return false;
-    }
     check("g906q2_mv");
     return true;
 // ---- gfx906 dense Q8_0, a wavefront a row, small blocks (the measured best read pattern: ~800 GB/s), FP32 math
@@ -677,295 +987,12 @@ __device__ __forceinline__ float g906r_dot16(uint4 w, const float4* xv) {
     }
     return a;
 }
-template <int MAXIT>
-__global__ void __launch_bounds__(256) g906r_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d,
-                                                    int N, int K, const float* __restrict__ x, float* y, MvConv c0,
-                                                    MvConv c1, MvAlt a0, MvAlt a1) {
-    const int lane = threadIdx.x & 63;
-    const int row = blockIdx.x * (int) (blockDim.x >> 6) + (threadIdx.x >> 6);
-    if (row >= N) return;
-    const int nch = K >> 4;
-    const uint4* qr = (const uint4*) (q + (size_t) row * K);
-    const uint16_t* dr = d + (size_t) row * (K >> 5);
-    uint4 w[MAXIT];
-    uint16_t ds[MAXIT];
-#pragma unroll
-    for (int it = 0; it < MAXIT; ++it) {
-        const int c = lane + 64 * it, cc = c < nch ? c : nch - 1;
-        w[it] = __ldg(qr + cc);
-        ds[it] = __ldg(dr + (cc >> 1));
-    }
-    const float4* x4 = (const float4*) ((unsigned) (row - a0.r0) < (unsigned) a0.n   ? a0.x
-                                        : (unsigned) (row - a1.r0) < (unsigned) a1.n ? a1.x
-                                                                                     : x);
-    float acc = 0.0f;
-#pragma unroll
-    for (int it = 0; it < MAXIT; ++it) {
-        const int c = lane + 64 * it;
-        if (c < nch) {
-            float4 xv[4];
-#pragma unroll
-            for (int k = 0; k < 4; ++k) xv[k] = __ldg(x4 + 4 * c + k);
-            acc = fmaf(g906r_dot16(w[it], xv), h2f(ds[it]), acc);
-        }
-    }
-    acc = g906_wsum64(acc);
-    if (lane == 0 && !mv_conv_row(c0, row, acc) && !mv_conv_row(c1, row, acc)) y[row] = acc;
-}
-static bool g906r_mv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
-                     const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
-    static const int wg = getenv("IK2_G906_RWG") ? atoi(getenv("IK2_G906_RWG")) : 0;
-    if (wg <= 0 || K % 32 || ((uintptr_t) q & 15) || (((uintptr_t) x | (uintptr_t) a0.x | (uintptr_t) a1.x) & 15))
-        return false;
-    const int mi = (K / 16 + 63) / 64;
-    const unsigned g = (unsigned) ((N + wg / 64 - 1) / (wg / 64));
-    switch (mi) {
-        case 1: g906r_kernel<1><<<g, wg, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1); break;
-        case 2: g906r_kernel<2><<<g, wg, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1); break;
-        case 3: g906r_kernel<3><<<g, wg, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1); break;
-        case 4: g906r_kernel<4><<<g, wg, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1); break;
-        default: return false;
-    }
-    check("g906r_mv");
-    return true;
-// ---- gfx906 dense Q8_0 v3: x quantized once (a small kernel: two int8 limbs a 32, into a device buffer: 3 slots for
-// a launch's inputs), then a wavefront a row in small blocks reading the limbs from L2 - no per-block LDS fill
-constexpr int kG906XqMaxK = 4096;
 struct G906Xq {
-    uint32_t hi[kG906XqMaxK / 4], lo[kG906XqMaxK / 4];
-    float sc[kG906XqMaxK / 32];
-};
-__device__ G906Xq g906_xq_buf[3];
-__global__ void __launch_bounds__(256) g906s_quant_kernel(const float* x0, const float* x1, const float* x2, int K) {
-    const float* x = blockIdx.y == 0 ? x0 : blockIdx.y == 1 ? x1 : x2;
-    if (!x) return;
-    G906Xq& o = g906_xq_buf[blockIdx.y];
-    const int t = blockIdx.x * 256 + threadIdx.x;   // (K / 4 a multiple of 8: whole groups of 8 lanes)
-    const float4 v = t < (K >> 2) ? *(const float4*) (x + 4 * t) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float mx = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
-    mx = fmaxf(mx, __shfl_xor(mx, 1, 64));
-    mx = fmaxf(mx, __shfl_xor(mx, 2, 64));
-    mx = fmaxf(mx, __shfl_xor(mx, 4, 64));
-    if (t >= (K >> 2)) return;
-    const float inv = mx > 0.0f ? 16256.0f / mx : 0.0f;
-    const float vv[4] = {v.x, v.y, v.z, v.w};
-    uint32_t h = 0, l = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int q = __float2int_rn(vv[i] * inv), hh = (q + 64) >> 7;
-        h |= (uint32_t) (uint8_t) hh << (8 * i);
-        l |= (uint32_t) (uint8_t) (q - 128 * hh) << (8 * i);
-    }
-    o.hi[t] = h;
-    o.lo[t] = l;
-    if ((t & 7) == 0) o.sc[t >> 3] = mx * (1.0f / 16256.0f);
-}
-template <int MAXIT>
-__global__ void __launch_bounds__(256) g906s_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d,
-                                                    int N, int K, float* y, MvConv c0, MvConv c1, MvAlt a0, MvAlt a1) {
-    const int lane = threadIdx.x & 63;
-    const int row = blockIdx.x * (int) (blockDim.x >> 6) + (threadIdx.x >> 6);
-    if (row >= N) return;
-    const int nch = K >> 4;
-    const uint4* qr = (const uint4*) (q + (size_t) row * K);
-    const uint16_t* dr = d + (size_t) row * (K >> 5);
-    uint4 w[MAXIT];
-    uint16_t ds[MAXIT];
-#pragma unroll
-    for (int it = 0; it < MAXIT; ++it) {
-        const int c = lane + 64 * it, cc = c < nch ? c : nch - 1;
-        w[it] = __ldg(qr + cc);
-        ds[it] = __ldg(dr + (cc >> 1));
-    }
-    const int slot = (unsigned) (row - a0.r0) < (unsigned) a0.n ? 1 : (unsigned) (row - a1.r0) < (unsigned) a1.n ? 2 : 0;
-    const G906Xq& X = g906_xq_buf[slot];
-    float acc = 0.0f;
-#pragma unroll
-    for (int it = 0; it < MAXIT; ++it) {
-        const int c = lane + 64 * it;
-        if (c < nch) {
-            const uint4 xh = ((const uint4*) X.hi)[c], xl = ((const uint4*) X.lo)[c];
-            int ih = __builtin_amdgcn_sdot4((int) w[it].x, (int) xh.x, 0, false);
-            ih = __builtin_amdgcn_sdot4((int) w[it].y, (int) xh.y, ih, false);
-            ih = __builtin_amdgcn_sdot4((int) w[it].z, (int) xh.z, ih, false);
-            ih = __builtin_amdgcn_sdot4((int) w[it].w, (int) xh.w, ih, false);
-            int il = __builtin_amdgcn_sdot4((int) w[it].x, (int) xl.x, 0, false);
-            il = __builtin_amdgcn_sdot4((int) w[it].y, (int) xl.y, il, false);
-            il = __builtin_amdgcn_sdot4((int) w[it].z, (int) xl.z, il, false);
-            il = __builtin_amdgcn_sdot4((int) w[it].w, (int) xl.w, il, false);
-static bool g906s_mv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
-                     const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
-    static const int wg = getenv("IK2_G906_SWG") ? atoi(getenv("IK2_G906_SWG")) : 128;
-    if (wg <= 0 || K % 128 || K > kG906XqMaxK || ((uintptr_t) q & 15) ||
-        (((uintptr_t) x | (uintptr_t) a0.x | (uintptr_t) a1.x) & 15))
-        return false;
-    const int mi = (K / 16 + 63) / 64;
-    if (mi > 4) return false;
-    g906s_quant_kernel<<<dim3((unsigned) ((K / 4 + 255) / 256), 3), 256, 0, s>>>(x, a0.n ? a0.x : nullptr,
-                                                                                 a1.n ? a1.x : nullptr, K);
-    check("g906s_quant");
-    static const int twg = getenv("IK2_G906_TWG") ? atoi(getenv("IK2_G906_TWG")) : 256;
-    const int rpb = twg / 64;
-    const int ntot = 2 * (K / 16) + K / 128;
-    if (twg >= 128 && ntot <= 2 * twg && (!a0.n || (a0.r0 % rpb == 0 && a0.n % rpb == 0)) &&
-        (!a1.n || (a1.r0 % rpb == 0 && a1.n % rpb == 0))) {
-        const unsigned gt = (unsigned) ((N + rpb - 1) / rpb);
-        const size_t lds = (size_t) ntot * 16;
-        switch (mi) {
-            case 1: g906t_kernel<1><<<gt, twg, lds, s>>>(q, d, N, K, y, c0, c1, a0, a1); break;
-            case 2: g906t_kernel<2><<<gt, twg, lds, s>>>(q, d, N, K, y, c0, c1, a0, a1); break;
-            case 3: g906t_kernel<3><<<gt, twg, lds, s>>>(q, d, N, K, y, c0, c1, a0, a1); break;
-            case 4: g906t_kernel<4><<<gt, twg, lds, s>>>(q, d, N, K, y, c0, c1, a0, a1); break;
-        }
-        check("g906t_mv");
-        return true;
-    }
-    const unsigned g = (unsigned) ((N + wg / 64 - 1) / (wg / 64));
-    switch (mi) {
-        case 1: g906s_kernel<1><<<g, wg, 0, s>>>(q, d, N, K, y, c0, c1, a0, a1); break;
-        case 2: g906s_kernel<2><<<g, wg, 0, s>>>(q, d, N, K, y, c0, c1, a0, a1); break;
-        case 3: g906s_kernel<3><<<g, wg, 0, s>>>(q, d, N, K, y, c0, c1, a0, a1); break;
-        case 4: g906s_kernel<4><<<g, wg, 0, s>>>(q, d, N, K, y, c0, c1, a0, a1); break;
-    }
-    check("g906s_mv");
-    return true;
-static bool g906q_mv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
-                     const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
-    static const int qwg = getenv("IK2_G906_QWG") ? atoi(getenv("IK2_G906_QWG")) : 256;
-    static const int lpr = getenv("IK2_G906_QLPR") ? atoi(getenv("IK2_G906_QLPR")) : 64;
-    if (!g906q_on() || K % 128 || ((uintptr_t) q & 15) || K / 4 > 3 * qwg || (lpr != 32 && lpr != 64)) return false;
-    const int rpb = qwg / lpr;
-    if ((a0.n && (a0.r0 % rpb || a0.n % rpb)) || (a1.n && (a1.r0 % rpb || a1.n % rpb))) return false;
-    if (getenv("IK2_SHAPES")) { static int nshow = 0; if (nshow++ < 200) std::fprintf(stderr, "Q8SHAPE %d %d %d %d\n", N, K, a0.n, a1.n); }
-    const int mi = (K / 16 + lpr - 1) / lpr;
-    const size_t lds = (size_t) K * 2 + (size_t) K / 32 * 4;
-    const unsigned g = (unsigned) ((N + rpb - 1) / rpb);
 #define G906Q_L(MI, L) g906q_kernel<MI, L><<<g, qwg, lds, s>>>(q, d, N, K, x, y, c0, c1, a0, a1)
-    if (lpr == 64) {
-        switch (mi) {
-            case 1: G906Q_L(1, 64); break;
-            case 2: G906Q_L(2, 64); break;
-            case 3: G906Q_L(3, 64); break;
-            case 4: G906Q_L(4, 64); break;
-            default: return false;
-        }
-    } else {
-        switch (mi) {
-            case 1: G906Q_L(1, 32); break;
-            case 2: G906Q_L(2, 32); break;
-            case 3: G906Q_L(3, 32); break;
-            case 4: G906Q_L(4, 32); break;
-            case 5: G906Q_L(5, 32); break;
-            case 6: G906Q_L(6, 32); break;
-            case 7: case 8: G906Q_L(8, 32); break;
-            default: return false;
-        }
 #undef G906Q_L
-    check("g906q_mv");
-    return true;
-// ---- gfx906 dense FP16 (router, dyn conv): a row a wavefront, 8 halves a lane a chunk, all loaded first, FP32 math
-template <int MAXIT>
-__global__ void __launch_bounds__(256) g906h_kernel(const uint16_t* __restrict__ W, int N, int K,
-                                                    const float* __restrict__ x, float* __restrict__ y) {
-    const int lane = threadIdx.x & 63, row = blockIdx.x * 4 + (threadIdx.x >> 6);
-    if (row >= N) return;
-    const int nch = K >> 3;
-    const uint4* wr = (const uint4*) (W + (size_t) row * K);
-    uint4 w[MAXIT];
-#pragma unroll
-    for (int it = 0; it < MAXIT; ++it) {
-        const int c = lane + 64 * it;
-        w[it] = __ldg(wr + (c < nch ? c : nch - 1));
-    float acc = 0.0f;
-#pragma unroll
-    for (int it = 0; it < MAXIT; ++it) {
-        const int c = lane + 64 * it;
-        if (c < nch) {
-            const float4 x0 = __ldg((const float4*) x + 2 * c), x1 = __ldg((const float4*) x + 2 * c + 1);
-            const uint32_t u[4] = {w[it].x, w[it].y, w[it].z, w[it].w};
-            const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                acc = fmaf(h2f((uint16_t) u[i]), xv[2 * i], acc);
-                acc = fmaf(h2f((uint16_t) (u[i] >> 16)), xv[2 * i + 1], acc);
-            }
-        }
-    acc = g906_wsum64(acc);
-    if (lane == 0) y[row] = acc;
-}
-static bool g906h_mv(const uint16_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
-    if (!g906q_on() || K % 8 || ((uintptr_t) W & 15) || ((uintptr_t) x & 15)) return false;
-    const int mi = (K / 8 + 63) / 64;
-    const unsigned g = (unsigned) ((N + 3) / 4);
-    switch (mi) {
-        case 1: g906h_kernel<1><<<g, 256, 0, s>>>(W, N, K, x, y); break;
-        case 2: g906h_kernel<2><<<g, 256, 0, s>>>(W, N, K, x, y); break;
-        case 3: g906h_kernel<3><<<g, 256, 0, s>>>(W, N, K, x, y); break;
-        case 4: g906h_kernel<4><<<g, 256, 0, s>>>(W, N, K, x, y); break;
-        case 5: g906h_kernel<5><<<g, 256, 0, s>>>(W, N, K, x, y); break;
-        case 6: g906h_kernel<6><<<g, 256, 0, s>>>(W, N, K, x, y); break;
-        case 7: case 8: g906h_kernel<8><<<g, 256, 0, s>>>(W, N, K, x, y); break;
-        default: return false;
-    }
-    check("g906h_mv");
-    return true;
-#endif
-#if defined(STRATA_USE_HIP)
-// ---- gfx906 batched dense Q8_0 (g906b): q8_tile's T <= 8 tokens (multi-slot decode, short verify windows)
-constexpr int kG906bMaxT = 8, kG906bMaxNtot = 2 * (4096 / 16) + 4096 / 128;
-__device__ uint4 g906b_xq[kG906bMaxT * kG906bMaxNtot];   // per token: hi [K/16] | lo [K/16] | sc [K/32 floats]
-__global__ void __launch_bounds__(256) g906b_quant_kernel(const uint16_t* __restrict__ x, int K) {
-    const int tk = blockIdx.y, ntot = 2 * (K >> 4) + (K >> 7);
-    uint32_t* hi = (uint32_t*) (g906b_xq + (size_t) tk * ntot);
-    uint32_t* lo = hi + (K >> 2);
-    float* sc = (float*) (lo + (K >> 2));
-    const int t = blockIdx.x * 256 + threadIdx.x;
-    float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (t < (K >> 2)) {
-        const uint2 u = *(const uint2*) (x + (size_t) tk * K + 4 * t);
-        v[0] = h2f((uint16_t) u.x), v[1] = h2f((uint16_t) (u.x >> 16)), v[2] = h2f((uint16_t) u.y),
-        v[3] = h2f((uint16_t) (u.y >> 16));
-    }
-    float mx = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
-    mx = fmaxf(mx, __shfl_xor(mx, 1, 64));
-    mx = fmaxf(mx, __shfl_xor(mx, 2, 64));
-    mx = fmaxf(mx, __shfl_xor(mx, 4, 64));
-    if (t >= (K >> 2)) return;
-    const float inv = mx > 0.0f ? 16256.0f / mx : 0.0f;
-    uint32_t h = 0, l = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int q = __float2int_rn(v[i] * inv), hh = (q + 64) >> 7;
-        h |= (uint32_t) (uint8_t) hh << (8 * i);
-        l |= (uint32_t) (uint8_t) (q - 128 * hh) << (8 * i);
-    }
-    hi[t] = h, lo[t] = l;
-    if ((t & 7) == 0) sc[t >> 3] = mx * (1.0f / 16256.0f);
-}
-constexpr int kG906bTG = 4;   // tokens an LDS fill
-#ifndef G906B_WPE
 #define G906B_WPE 1
-#endif
-// lane-transpose reduction of V (a power of 2) values: lane L ends with the full sum of value idx in acc[0]
-template <int N_, int M_>
 struct G906TStep {
-    static __device__ __forceinline__ void run(float* acc, int lane, int& idx) {
-        const bool up = (lane & M_) != 0;
-#pragma unroll
-        for (int i = 0; i < N_ / 2; ++i) {
-            const float keep = up ? acc[i + N_ / 2] : acc[i], send = up ? acc[i] : acc[i + N_ / 2];
-            acc[i] = keep + __shfl_xor(send, M_, 64);
-        }
-        if (up) idx += N_ / 2;
-        G906TStep<N_ / 2, M_ / 2>::run(acc, lane, idx);
-    }
-};
-template <int M_>
 struct G906TStep<1, M_> {
-    static __device__ __forceinline__ void run(float* acc, int lane, int& idx) {
-        if constexpr (M_ > 0) {
-            acc[0] += __shfl_xor(acc[0], M_, 64);
-            G906TStep<1, M_ / 2>::run(acc, lane, idx);
         }
     }
 };
@@ -974,7 +1001,9 @@ __device__ __forceinline__ int g906_treduce(float* acc, int lane) {
     int idx = 0;
     G906TStep<V, 32>::run(acc, lane, idx);
     return idx;
+}
 struct G906Pow2 { static constexpr int v = N_ <= 1 ? 1 : N_ <= 2 ? 2 : N_ <= 4 ? 4 : N_ <= 8 ? 8 : N_ <= 16 ? 16 : 32; };
+    }
 static bool g906b_on() {
     static const bool on = !getenv("IK2_G906_B") || atoi(getenv("IK2_G906_B"));
     return on;
@@ -1037,25 +1066,10 @@ static bool g906b_mv(const int8_t* q, const uint16_t* d, int N, int K, const uin
     check("g906b_mv");
     return true;
 }
-#endif
-#if defined(STRATA_USE_HIP)
-    if (g906b_mv(q, d, N, K, x, T, y, ldy, s)) return;
-#endif
-#if defined(STRATA_USE_HIP)
-    if (g906q_on() && g906s_mv(q, d, N, K, x, y, c0, c1, s, a0, a1)) return;
-    if (g906q_on() && g906r_mv(q, d, N, K, x, y, c0, c1, s, a0, a1)) return;
-    if (g906q_on() && g906q2_mv(q, d, N, K, x, y, c0, c1, s, a0, a1)) return;
-    if (g906q_mv(q, d, N, K, x, y, c0, c1, s, a0, a1)) return;
-#endif
-#if defined(STRATA_USE_HIP)
-    if (N > 0 && g906h_mv(W, N, K, x, y, s)) return;
-#endif
-    unsigned nt = (unsigned) ((E + 31) / 32 * 32);
-#if defined(STRATA_USE_HIP)
-    if (E <= 128 && E % 32 == 0) nt = (unsigned) (8 * E);   // (route_token_kernel's 8-thread ranks)
-#endif
-    #if defined(STRATA_USE_HIP)
-    if (g906da_launch<uint16_t>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel, extent, window, scratch, P,
+    }
+    const int idx = g906_treduce<V>(acc, lane);
+    if ((lane & (64 / V - 1)) == 0 && idx < NT) y[(size_t) idx * y_ld + row] = acc[0];
+}
 static bool g906hr_mv(const uint16_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
                       cudaStream_t s) {
     static const bool on = !getenv("IK2_G906_HR") || atoi(getenv("IK2_G906_HR"));
@@ -1078,6 +1092,23 @@ static bool g906hr_mv(const uint16_t* W, int N, int K, const float* x, int x_ld,
     check("g906hr_mv");
     return true;
 }
+#endif
+template <bool BF>
+__device__ __forceinline__ void g906_h8(const uint4 u, float* f) {
+    const uint32_t a[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if constexpr (BF) {
+            f[2 * i] = __uint_as_float(a[i] << 16), f[2 * i + 1] = __uint_as_float(a[i] & 0xFFFF0000u);
+        } else {
+            f[2 * i] = h2f((uint16_t) a[i]), f[2 * i + 1] = h2f((uint16_t) (a[i] >> 16));
+        }
+    }
+}
+        const int r = r0 + idx / NT, t = idx % NT;
+        if (r < N) Y[(size_t) t * ldy + r] = acc[0];
+    }
+}
 bool g906_gemm16(bool bf, const uint16_t* W, int N, int K, const uint16_t* X, int T, float* Y, int ldy, cudaStream_t s) {
     static const bool on = !getenv("IK2_G906_BF") || atoi(getenv("IK2_G906_BF"));
     if (!on || T < 1 || T > 8 || K % 8 || ((uintptr_t) W & 15) || ((uintptr_t) X & 15)) return false;
@@ -1093,10 +1124,10 @@ bool g906_gemm16(bool bf, const uint16_t* W, int N, int K, const uint16_t* X, in
     return true;
 }
 struct G906PfArgs {
-    const uint8_t* blob[kG906PfMaxE];
-    int start[kG906PfMaxE], cnt[kG906PfMaxE], tile0[kG906PfMaxE + 1];
-    int ne;
-};
+            for (int i = 0; i < RM; ++i) yr[16 * i] = acc[i][j];
+        }
+    }
+}
 bool g906pf_on() {
     static const int on = getenv("IK2_G906_PF") ? atoi(getenv("IK2_G906_PF")) : 1;
     return on != 0;
@@ -1137,19 +1168,6 @@ bool g906pf_mm(int ty, int n_exp, const int* exps, const uint8_t* const* blob, c
     }
     return true;
 }
-
-// Public host gate and one-visit expert entry (used by the engine's decode path).
-bool ik2_g906_ok() {
-    static const bool ok = [] {
-        if (!g906_on()) return false;
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) return false;
-        cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
-        return std::strncmp(prop.gcnArchName, "gfx906", 6) == 0;
-    }();
-    return ok;
-}
 bool ik2_g906_experts(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, int ty_down,
                       size_t eb0, size_t off_down, const float* x, const uint16_t* h, int C, int F, const float* sg,
                       const float* su, float gcap, float ucap, uint16_t* hout, float* y, cudaStream_t s) {
@@ -1158,7 +1176,6 @@ bool ik2_g906_experts(const uint8_t* const* blob, const int* tok, int S, int ty_
     if (!g906_down(blob, S, ty_down, off_down, hout ? hout : h, C, F, y, s)) return false;
     return true;
 }
-
 #else   // not gfx906: decline every entry point
 bool g906pf_on() { return false; }
 bool g906pf_mm(int, int, const int*, const uint8_t* const*, const int*, const int*, size_t, size_t, int,
@@ -1175,5 +1192,4 @@ bool ik2_g906_experts(const uint8_t* const*, const int*, int, int, int, int, siz
                       const uint16_t*, int, int, const float*, const float*, float, float, uint16_t*, float*,
                       cudaStream_t) { return false; }
 #endif  // IK2_G906_TARGET
-
 #endif   // STRATA_USE_HIP
