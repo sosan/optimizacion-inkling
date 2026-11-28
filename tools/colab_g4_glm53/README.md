@@ -10,6 +10,12 @@ en `:8090` de la VM y abre un port-forward SSH **autoreparable** hacia
 Cuando `/v1/models` responde `200 OK`, imprime los endpoints locales, el nombre
 del modelo, los snippets `OPENAI_*` / Claude Code y el comando de parada.
 
+> **Aviso de uso**: esta herramienta está pensada para uso personal y local con
+> tu propia cuenta de Colab. El **alojamiento público** del endpoint (exponerlo
+> a terceros, compartirlo o revender el acceso) podría **infringir las reglas de
+> uso de Google** y las condiciones del servicio de Colab. Úsalo bajo tu propia
+> responsabilidad y no lo ofrezcas como servicio público.
+
 ## Requisitos
 
 - Cuenta de Google Colab con Compute Units (Pro / AI Pro / AI Ultra).
