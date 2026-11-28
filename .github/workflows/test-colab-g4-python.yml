@@ -1,0 +1,51 @@
+name: Test Colab G4 Python launcher
+
+# Smoke-tests the Python port of colab-g4-glm53 on Linux and Windows. No Colab
+# account, CLI or network access is needed: argparse, JSON configs, the streamed
+# VM provisioner and the /v1/models probe (against a local HTTP server).
+
+on:
+  push:
+    branches: ['pr/**']
+    paths:
+      - 'tools/colab_g4_glm53/**'
+      - '.github/workflows/test-colab-g4-python.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: colab-g4-python-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Compile Python sources
+        shell: bash
+        run: python -m py_compile tools/colab_g4_glm53/colab_g4.py tools/colab_g4_glm53/remote_provision.py tools/colab_g4_glm53/test_colab_g4.py
+
+      - name: Run smoke tests
+        shell: bash
+        run: python -m unittest tools.colab_g4_glm53.test_colab_g4 -v
+
+      - name: CLI smoke check
+        shell: bash
+        run: |
+          python tools/colab_g4_glm53/colab_g4.py --help
+          python tools/colab_g4_glm53/remote_provision.py --help

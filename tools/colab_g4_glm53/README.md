@@ -61,14 +61,14 @@ del sistema con el nombre `colab-tunnel-<sesion>-<puerto>`.
 
 ## Diferencias respecto a los scripts bash
 
-- Un único archivo Python en vez de `start.sh` / `tunnel.sh` / `stop.sh`.
+- Un único CLI Python en vez de `start.sh` / `tunnel.sh` / `stop.sh`. No queda código bash incrustado: el aprovisionamiento de la VM es `remote_provision.py`, un segundo archivo Python que se envía por `stdin` a `ssh ... python3 -`. `apt-get`, `cmake`, `pip` y `pkill` se lanzan con `subprocess` desde Python.
 - Rutas y procesos multiplataforma (`pathlib`, `tempfile`, `shutil.which`,
   `subprocess` sin `shell=True`; `taskkill` en Windows, `pkill` en Unix).
 - El aprovisionamiento remoto se envía por `stdin` a `ssh ... bash -s --`, sin
   archivos temporales locales.
 - Los snippets de entorno usan `set VAR=...` en Windows y `export VAR=...` en Unix.
 - La lógica remota (compilación, descarga, pack, configuración y carga) es la
-  misma del patch upstream; los `configs/` se copian tal cual.
+  misma del patch upstream; los `configs/` se copian tal cual. Archivos: `colab_g4.py` (CLI local), `remote_provision.py` (VM), `test_colab_g4.py` (smoke tests) y `configs/`.
 
 ## Rendimiento de referencia (upstream, G4)
 
