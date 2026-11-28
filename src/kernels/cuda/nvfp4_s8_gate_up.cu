@@ -33,7 +33,7 @@ __device__ __forceinline__ uint16_t half_bits(float f) { return __half_as_ushort
 // One CTA: expert e (blockIdx.y), 16 gate/up rows starting at r0 (blockIdx.x).
 // 8 warps split K=2304 into 18 steps of 16 values: kk = wp + 8*j.
 __global__ void gate_up_s8_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ tok,
-                                  const int* __restrict__ row, size_t eb0, int C, int F,
+                                  const int* __restrict__ orow, size_t eb0, int C, int F,
                                   const uint32_t* __restrict__ xq, const float* __restrict__ sg,
                                   const float* __restrict__ su, float gcap, float ucap,
                                   uint16_t* __restrict__ h) {
@@ -95,7 +95,7 @@ __global__ void gate_up_s8_kernel(const uint8_t* const* __restrict__ blob, const
         const float g0 = pg[0] + pg[4], g1 = pg[1] + pg[5], g2 = pg[2] + pg[6], g3 = pg[3] + pg[7];
         const float u0 = pu[0] + pu[4], u1 = pu[1] + pu[5], u2 = pu[2] + pu[6], u3 = pu[3] + pu[7];
         const float gv = (g0 + g2) + (g1 + g3), uv = (u0 + u2) + (u1 + u3);
-        const int slot = e * 8 + col, ro = row[slot];
+        const int slot = e * 8 + col, ro = orow[slot];
         const float g = gv * (sg ? sg[ro] : 1.0f), u = uv * (su ? su[ro] : 1.0f);
         h[(size_t) ro * F + r0 + row] =
             half_bits(gcap * tanhf(g / gcap) * (1.0f / (1.0f + expf(-g))) * ucap * tanhf(u / ucap));
@@ -119,7 +119,7 @@ bool gate_up_s8(const uint8_t* const* blob, const int* tok, const int* row, int 
 
 namespace strata::kernels::nvfp4s8 {
 
-bool gate_up_s8(const uint8_t*, const int*, const int*, int, size_t, int, int, const void*, const float*,
+bool gate_up_s8(const uint8_t* const*, const int*, const int*, int, size_t, int, int, const void*, const float*,
                 const float*, float, float, uint16_t*, void*) {
     return false;
 }
