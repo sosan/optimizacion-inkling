@@ -15,6 +15,7 @@ add_library(inkling_custom_kernels STATIC
   "${INKLING_CUSTOM_ENGINE_ROOT}/src/ik2/ik2_kernels.cu"
   "${INKLING_CUSTOM_ENGINE_ROOT}/src/kernels/cuda/iq_kernels.cu"
   "${INKLING_CUSTOM_ENGINE_ROOT}/src/kernels/cuda/native_mmvq.cu"
+  "${INKLING_CUSTOM_ENGINE_ROOT}/src/kernels/cuda/nvfp4_s8_gate_up.cu"
 )
 
 target_include_directories(inkling_custom_kernels PUBLIC
@@ -69,6 +70,19 @@ add_executable(ik2_nvfp4_s8_test
 )
 target_include_directories(ik2_nvfp4_s8_test PRIVATE
   "${INKLING_CUSTOM_ENGINE_ROOT}/include"
+)
+
+# Correctness of the s8 MMA gate/up kernel against an independent scalar
+# reference. CI only builds it; it needs a GPU, so the user runs it locally.
+add_executable(ik2_nvfp4_s8_gate_up_test
+  "${INKLING_CUSTOM_ENGINE_ROOT}/tests/ik2_nvfp4_s8_gate_up_test.cu"
+)
+target_include_directories(ik2_nvfp4_s8_gate_up_test PRIVATE
+  "${INKLING_CUSTOM_ENGINE_ROOT}/include"
+)
+target_link_libraries(ik2_nvfp4_s8_gate_up_test PRIVATE
+  inkling_custom_kernels
+  CUDA::cudart
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND

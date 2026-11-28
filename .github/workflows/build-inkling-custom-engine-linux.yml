@@ -135,6 +135,11 @@ jobs:
       - name: Build expert A/B benchmark
         run: cmake --build build --target ik2_expert_bench -j "$(nproc)"
 
+      # The s8 gate/up correctness test needs a GPU; CI only compiles it and ships
+      # the binary so it can be run on the developer's sm_89 / sm_120 machine.
+      - name: Build NVFP4 s8 gate/up correctness test
+        run: cmake --build build --target ik2_nvfp4_s8_gate_up_test -j "$(nproc)"
+
       - name: Verify executable
         run: |
           test -x build/inkling-custom-engine
@@ -149,6 +154,13 @@ jobs:
         with:
           name: ik2-expert-bench-cuda${{ inputs.cuda_arch }}-ubuntu${{ steps.flavor.outputs.suffix }}
           path: build/ik2_expert_bench
+          if-no-files-found: error
+
+      - name: Upload NVFP4 s8 gate/up test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ik2-nvfp4-s8-test-cuda${{ inputs.cuda_arch }}-ubuntu${{ steps.flavor.outputs.suffix }}
+          path: build/ik2_nvfp4_s8_gate_up_test
           if-no-files-found: error
 
       - name: Upload inkling-custom-engine artifact

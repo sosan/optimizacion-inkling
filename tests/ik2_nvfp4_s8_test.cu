@@ -10,29 +10,22 @@
 
 using namespace strata::kernels::nvfp4s8;
 
-static uint32_t byte_perm_ref(uint32_t x, uint32_t y, uint32_t s) {
-    const uint8_t b[8] = {uint8_t(x), uint8_t(x >> 8), uint8_t(x >> 16), uint8_t(x >> 24),
-                          uint8_t(y), uint8_t(y >> 8), uint8_t(y >> 16), uint8_t(y >> 24)};
-    uint32_t out = 0;
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t n = (s >> (4 * i)) & 7u;
-        out |= uint32_t(b[n]) << (8 * i);
-    }
-    return out;
-}
-
 static uint32_t word_ref(const uint8_t* p, int i) {
     return uint32_t(p[4 * i]) | (uint32_t(p[4 * i + 1]) << 8) |
            (uint32_t(p[4 * i + 2]) << 16) | (uint32_t(p[4 * i + 3]) << 24);
 }
 
+// Independent reference: ggml's kvalues_fp4 table (the doubled E2M1 values),
+// indexed by the nibbles the GGUF block assigns to this thread's k = 4t .. 4t+3.
 static uint32_t frag_ref(uint32_t q4, int t) {
-    const uint32_t nibs = (t & 2) ? ((q4 >> 4) & 0x0F0F0F0Fu) : (q4 & 0x0F0F0F0Fu);
-    const uint32_t sel = (nibs & 0x0Fu) | ((nibs >> 4) & 0xF0u) |
-                         ((nibs >> 8) & 0xF00u) | ((nibs >> 12) & 0xF000u);
-    const uint32_t lo = byte_perm_ref(0x03020100u, 0x0c080604u, sel);
-    const uint32_t hi = byte_perm_ref(0xfdfeff00u, 0xf4f8fafcu, sel);
-    return byte_perm_ref(lo, hi, 0x3210u | ((sel & 0x8888u) >> 1));
+    static const int8_t kvalues_fp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    const int hi = (t & 2) ? 4 : 0;   // low nibble of each byte, or high nibble
+    uint32_t out = 0;
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t code = (q4 >> (8 * j + hi)) & 0xFu;
+        out |= uint32_t(uint8_t(kvalues_fp4[code])) << (8 * j);
+    }
+    return out;
 }
 
 __global__ void frag_test(const Block* __restrict__ blocks, const uint32_t* __restrict__ want, int* __restrict__ bad,
@@ -45,6 +38,11 @@ __global__ void frag_test(const Block* __restrict__ blocks, const uint32_t* __re
 }
 
 int main() {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+        std::printf("ik2_nvfp4_s8_test: SKIP (no CUDA device; CI only compiles this test)\n");
+        return 0;
+    }
     const int n = 4096;
     std::mt19937 rng(1234);
     std::vector<Block> h(n / 4);

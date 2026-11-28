@@ -20,7 +20,7 @@ find_package(Threads REQUIRED)
 
 set(IK2_GPU_SOURCES src/ik2/ik2_kernels.cu src/ik2/ik2_main.cu src/ik2/ik2_draft.cu)
 # llama.cpp's IQ / native GGUF dot kernels (issue #19: the fused path for small quants).
-set(IQ_GPU_SOURCES src/kernels/cuda/iq_kernels.cu src/kernels/cuda/native_mmvq.cu)
+set(IQ_GPU_SOURCES src/kernels/cuda/iq_kernels.cu src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nvfp4_s8_gate_up.cu)
 
 if(STRATA_ENABLE_HIP)
   find_package(hip REQUIRED)
@@ -44,15 +44,22 @@ if(STRATA_ENABLE_HIP)
 else()
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
-  # Basalt-derived NVFP4 -> int8 fragment test (sm_80+; sm_89 and sm_120 both covered).
-  add_executable(ik2_nvfp4_s8_test tests/ik2_nvfp4_s8_test.cu)
-  target_include_directories(ik2_nvfp4_s8_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
   set(IK2_GPU_BLAS CUDA::cublas)
   set(IK2_GPU_INCLUDE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 endif()
 
 add_library(inkling_custom_kernels STATIC src/ik2/ik2_kernels.cu ${IQ_GPU_SOURCES})
 set_target_properties(inkling_custom_kernels PROPERTIES LINKER_LANGUAGE CXX)
+
+if(NOT STRATA_ENABLE_HIP)
+  # Basalt-derived NVFP4 -> int8 tests (sm_80+; sm_89 and sm_120 both covered).
+  # The fragment test runs in CI; the gate/up test needs a GPU and is only built there.
+  add_executable(ik2_nvfp4_s8_test tests/ik2_nvfp4_s8_test.cu)
+  target_include_directories(ik2_nvfp4_s8_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  add_executable(ik2_nvfp4_s8_gate_up_test tests/ik2_nvfp4_s8_gate_up_test.cu)
+  target_include_directories(ik2_nvfp4_s8_gate_up_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(ik2_nvfp4_s8_gate_up_test PRIVATE inkling_custom_kernels CUDA::cudart)
+endif()
 target_include_directories(inkling_custom_kernels PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/ik2"

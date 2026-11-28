@@ -13,7 +13,9 @@
 // Use `-` to skip the output dump. Compare GFLOP/s across quants to size a dedicated kernel.
 #include "../src/ik2/ik2_kernels.cuh"
 #include "strata/kernels/iq_f16.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/nvfp4_s8_gate_up.hpp"
 
 // HIP pulls these in through its runtime headers; nvcc needs them explicitly for
 // __float2half_rn / __half_as_ushort in the host-side activation generator.
@@ -96,7 +98,8 @@ int main(int argc, char** argv) {
     const char* mode = argc > 1 ? argv[1] : "gate";
     const bool fused_gate = std::strcmp(mode, "gatefused") == 0, fused_down = std::strcmp(mode, "downfused") == 0;
     const bool fused = fused_gate || fused_down;
-    const bool gate = std::strcmp(mode, "gate") == 0 || std::strcmp(mode, "gate1") == 0 || fused_gate;
+    const bool s8_gate = std::strcmp(mode, "gates8") == 0;   // Basalt NVFP4 -> int8 mma.sync path
+    const bool gate = std::strcmp(mode, "gate") == 0 || std::strcmp(mode, "gate1") == 0 || fused_gate || s8_gate;
     const bool single = std::strcmp(mode, "gate1") == 0 || std::strcmp(mode, "down1") == 0;   // (the one-token path)
     const int iters = argc > 2 ? std::atoi(argv[2]) : 20;
     const char* out_path = argc > 3 ? argv[3] : nullptr;
@@ -180,12 +183,18 @@ int main(int argc, char** argv) {
         CU(cudaMalloc(&df32, (size_t) K * C * sizeof(float)));
         CU(cudaMalloc(&dq81, strata::kernels::native_q8_1_bytes(C, K)));
     }
+    if (s8_gate) CU(cudaMalloc(&dq81, (size_t) S * (C / 32) * 36));
 
     cudaStream_t s = nullptr;
     // native_mmvq() requires an explicit non-null stream; the scalar ik2 kernels accept nullptr.
     if (fused) CU(cudaStreamCreate(&s));
     auto once = [&] {
-        if (single) {
+        if (s8_gate) {
+            // Basalt's mma.sync.s8 path: quantize once outside the timed region is
+            // not representative of the engine, so do it inside like the scalar path's decode.
+            strata::kernels::quantize_q8_1_rows(dinput32, S, C, dq81, s);
+            strata::kernels::nvfp4s8::gate_up_s8(dblob, dtok, drow, G, eb0, C, F, dq81, dsg, dsu, 20.0f, 20.0f, dh, s);
+        } else if (single) {
             if (gate)
                 ik2::k::experts_gate_up_swiglu_mma(dblob, S, eb0, dinput2, C, F, dsg, dsu, 20.0f, 20.0f, dh, s);
             else
