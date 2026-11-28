@@ -63,6 +63,14 @@ target_link_libraries(ik2_expert_bench PRIVATE
   Threads::Threads
 )
 
+# Basalt-derived NVFP4 -> int8 fragment test (CUDA CI, sm_89 + sm_120).
+add_executable(ik2_nvfp4_s8_test
+  "${INKLING_CUSTOM_ENGINE_ROOT}/tests/ik2_nvfp4_s8_test.cu"
+)
+target_include_directories(ik2_nvfp4_s8_test PRIVATE
+  "${INKLING_CUSTOM_ENGINE_ROOT}/include"
+)
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND
    CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   find_package(OpenMP QUIET COMPONENTS CXX)

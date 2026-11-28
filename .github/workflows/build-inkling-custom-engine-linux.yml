@@ -127,6 +127,11 @@ jobs:
       - name: Build inkling-custom-engine
         run: cmake --build build --target inkling-custom-engine -j "$(nproc)"
 
+      - name: Build and run NVFP4 s8 fragment test
+        run: |
+          cmake --build build --target ik2_nvfp4_s8_test -j "$(nproc)"
+          ./build/ik2_nvfp4_s8_test
+
       - name: Build expert A/B benchmark
         run: cmake --build build --target ik2_expert_bench -j "$(nproc)"
 
